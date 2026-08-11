@@ -783,7 +783,6 @@ import {
   WORD_MATCH_SCORE,
   EXACT_PHRASE_BONUS,
   MAJORITY_MATCH_BONUS,
-  TOOL_USAGE_SCORE,
   FILE_REFERENCE_SCORE,
   PROJECT_MATCH_SCORE,
   CORE_TECH_PATTERN,
@@ -841,13 +840,16 @@ export function calculateRelevanceScore(
   score += scoreSupportingTerms(queryWords, contentWordSet);
 
   // Gate metadata bonuses behind query term match.
-  // Without this, scoreToolUsage(+5) and scoreFileReferences(+3) give positive
-  // scores to messages with ZERO query relevance — "xyznonexistent" returns results.
+  // Without this, scoreFileReferences(+3) gives positive scores to messages with
+  // ZERO query relevance — "xyznonexistent" would return results.
+  //
+  // A scoreToolUsage(+5) term sat here too, keyed on type === 'tool_use' ||
+  // 'tool_result'. Those values never occur on disk — tool calls are content
+  // blocks, not record types — so it contributed nothing and is removed.
   const anyTermMatched =
     queryWords.length === 0 || queryWords.some((w) => lowerContent.includes(w));
 
   if (anyTermMatched) {
-    score += scoreToolUsage(message);
     score += scoreFileReferences(lowerContent);
     score += scoreProjectMatch(message, projectPath);
 
@@ -940,10 +942,6 @@ function scoreSupportingTerms(queryWords: string[], contentWordSet: Set<string>)
   return score;
 }
 
-function scoreToolUsage(message: ClaudeMessage): number {
-  return message.type === 'tool_use' || message.type === 'tool_result' ? TOOL_USAGE_SCORE : 0;
-}
-
 function scoreFileReferences(lowerContent: string): number {
   return lowerContent.includes('src/') ||
     lowerContent.includes('.ts') ||
@@ -981,6 +979,64 @@ export function formatTimestamp(timestamp: string): string {
  * @param timeframe - "today", "yesterday", "week", "month", or undefined (no filter).
  * @returns Predicate that returns `true` for timestamps within the range.
  */
+export function getTimeRangeCutoff(timeframe?: string): number | undefined {
+  if (!timeframe) return undefined;
+
+  const now = new Date();
+  const cutoff = new Date();
+
+  switch (timeframe.toLowerCase()) {
+    case 'today':
+      cutoff.setHours(0, 0, 0, 0);
+      break;
+    case 'yesterday':
+      cutoff.setDate(now.getDate() - 1);
+      cutoff.setHours(0, 0, 0, 0);
+      break;
+    case 'week':
+    case 'last-week':
+      cutoff.setDate(now.getDate() - 7);
+      break;
+    case 'month':
+    case 'last-month':
+      cutoff.setMonth(now.getMonth() - 1);
+      break;
+    default:
+      return undefined;
+  }
+  return cutoff.getTime();
+}
+
+/**
+ * Drop files that cannot contain messages inside a timeframe.
+ *
+ * @remarks
+ * The time filter was applied per message, after parsing, so a
+ * `timeframe:"week"` query still read every byte of every file and measured no
+ * faster than an unfiltered one. A file's mtime bounds the timestamps inside
+ * it, so files last written before the cutoff can be skipped outright.
+ *
+ * A day of slack absorbs clock skew and sessions resumed across a boundary;
+ * being generous here costs a little work, being tight would lose messages.
+ */
+export async function filterFilesByMtime(
+  projectDir: string,
+  files: string[],
+  cutoffMs: number,
+): Promise<string[]> {
+  const SKEW_MS = 24 * 60 * 60 * 1000;
+  const base = join(getClaudeProjectsPath(), projectDir);
+  const kept = await mapWithConcurrency(files, FILE_CONCURRENCY, async (file) => {
+    try {
+      const { mtimeMs } = await stat(join(base, file));
+      return mtimeMs >= cutoffMs - SKEW_MS ? file : undefined;
+    } catch {
+      return file;
+    }
+  });
+  return kept.filter((f): f is string => typeof f === 'string');
+}
+
 export function getTimeRangeFilter(timeframe?: string): (timestamp: string) => boolean {
   if (!timeframe) return () => true;
 

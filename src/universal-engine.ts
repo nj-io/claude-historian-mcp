@@ -656,6 +656,10 @@ export class UniversalHistorySearchEngine {
       }
     }
 
+    // NOTE: type is never 'tool_result' on disk, so this loop is inert. Left in
+    // place rather than deleted because the accomplishment heuristics below are
+    // the only ones of their kind; reviving them means matching on content
+    // blocks instead of record type.
     for (const msg of messages) {
       if (msg.type === 'tool_result' && msg.content && msg.content.length > 20) {
         if (msg.content.includes('\u2728 Done') || msg.content.includes('Successfully compiled')) {

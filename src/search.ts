@@ -26,6 +26,8 @@ import {
   findProjectDirectories,
   findJsonlFiles,
   getTimeRangeFilter,
+  getTimeRangeCutoff,
+  filterFilesByMtime,
   findPlanFiles,
   getClaudePlansPath,
   getClaudeProjectsPath,
@@ -262,6 +264,7 @@ export class HistorySearchEngine {
         query,
         analysis,
         timeFilter,
+        getTimeRangeCutoff(timeframe),
       );
 
       // Project-name boosting: if any query term matches a project directory name,
@@ -328,6 +331,7 @@ export class HistorySearchEngine {
     query: string,
     analysis: QueryAnalysis,
     timeFilter: ((timestamp: string) => boolean) | undefined,
+    cutoffMs?: number,
   ): Promise<CompactMessage[]> {
     // All projects in one Promise.allSettled — libuv thread pool (4 threads)
     // already throttles I/O. No batching, no caps, no early termination.
@@ -335,7 +339,7 @@ export class HistorySearchEngine {
     // parallelizes across all JSONL files within the project).
     const projectResults = await Promise.allSettled(
       projectDirs.map((projectDir) =>
-        this.processProjectFocused(projectDir, query, analysis, timeFilter),
+        this.processProjectFocused(projectDir, query, analysis, timeFilter, cutoffMs),
       ),
     );
 
@@ -357,12 +361,16 @@ export class HistorySearchEngine {
     query: string,
     _analysis: QueryAnalysis,
     timeFilter: ((timestamp: string) => boolean) | undefined,
+    cutoffMs?: number,
   ): Promise<CompactMessage[]> {
     try {
       // Conversation search is the one caller that wants subagent transcripts.
       // Session listing and session-by-id lookup must not see them — see
       // findJsonlFilesRecursive for why.
-      const jsonlFiles = await findJsonlFilesRecursive(projectDir);
+      let jsonlFiles = await findJsonlFilesRecursive(projectDir);
+      if (cutoffMs !== undefined) {
+        jsonlFiles = await filterFilesByMtime(projectDir, jsonlFiles, cutoffMs);
+      }
 
       // Bounded fan-out. Issuing every file at once was fine at 64 files per
       // project; with subagent transcripts included one project holds 1,282,
