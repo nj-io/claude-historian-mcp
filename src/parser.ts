@@ -80,7 +80,9 @@ export class ConversationParser {
     // skip irrelevant lines without affecting scoring or context extraction.
     const queryTerms = preFilterTerms || queryWords;
 
+    let lineNo = 0;
     const processLine = (line: string): void => {
+      lineNo++;
       if (!line.trim()) return;
 
       // Record-type gate. Roughly a quarter of corpus bytes are records that
@@ -144,11 +146,24 @@ export class ConversationParser {
           content: this.smartContentPreservation(content, this.getContentLimit(content)),
           sessionId: claudeMessage.sessionId,
           projectPath: decodeProjectPath(projectDir),
+          // Provenance: without these a hit is a dead end — the caller sees a
+          // snippet and has no way to reach the surrounding conversation.
+          sourceFile: join(projectDir, filename),
+          sourceLine: lineNo,
           relevanceScore,
           context,
         };
         if (claudeMessage.slug) {
           msg.sessionSlug = claudeMessage.slug;
+        }
+        // Subagent records carry the PARENT's sessionId, so isSidechain and
+        // agentId are the only way to tell delegated work apart from the
+        // parent's own messages.
+        if (claudeMessage.isSidechain) {
+          msg.isSidechain = true;
+        }
+        if (claudeMessage.agentId) {
+          msg.agentId = claudeMessage.agentId;
         }
         messages.push(msg);
 

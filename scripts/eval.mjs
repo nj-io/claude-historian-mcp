@@ -33,6 +33,9 @@ const LOCAL_FIXTURES = join(ROOT, 'test', 'fixtures', 'queries.local.json');
 const SAMPLE_FIXTURES = join(ROOT, 'test', 'fixtures', 'queries.sample.json');
 const BASELINE = join(ROOT, 'test', 'fixtures', 'baseline.local.json');
 
+/** Extra results fetched to absorb self-session rows removed after retrieval. */
+const SELF_EXCLUSION_HEADROOM = 20;
+
 /** The session running this eval; its rows are excluded from pin matching. */
 const SELF_SESSION = process.env.CLAUDE_CODE_SESSION_ID ?? '';
 
@@ -51,6 +54,12 @@ const fixturesPath =
 
 function createClient() {
   const proc = spawn('node', [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
+  // Decode as UTF-8 at the stream, not by concatenating Buffers. Appending a
+  // Buffer to a string decodes each chunk independently, so a multi-byte
+  // character straddling a chunk boundary becomes U+FFFD and silently corrupts
+  // the JSON — which showed up as phantom recall failures on the largest
+  // responses, the ones most likely to span chunks.
+  proc.stdout.setEncoding('utf8');
   const pending = new Map();
   let buf = '';
   let nextId = 0;
@@ -91,10 +100,16 @@ function createClient() {
  * formatter.fmt() prefixes each body line with "  │   " or "  └   ".
  */
 function unwrap(text) {
-  const body = text
-    .split('\n')
-    .filter((l) => l.startsWith('  │   ') || l.startsWith('  └   '))
-    .map((l) => l.slice(6))
+  // Strip exactly one box prefix per line. A filter+slice loses any body line
+  // that does not carry the prefix, and corrupts the JSON when message content
+  // itself quotes box characters — which happens as soon as this tool's own
+  // output ends up in the history it searches.
+  const lines = text.split('\n');
+  const start = lines.findIndex((l) => /^ {2}[│└] {3}/.test(l));
+  if (start === -1) return null;
+  const body = lines
+    .slice(start)
+    .map((l) => (/^ {2}[│└] {3}/.test(l) ? l.slice(6) : l))
     .join('\n');
   try {
     return JSON.parse(body);
@@ -149,13 +164,18 @@ async function main() {
 
   for (const fx of fixtures) {
     const k = fx.expect_within_top ?? 10;
+    // Self-session rows are filtered client-side, after retrieval. Asking for
+    // exactly k would let the running conversation crowd the pin out of the
+    // window before exclusion ever runs — and it does, because this session
+    // grows as the eval is developed. Retrieval depth must exceed k.
+    const depth = fx.exclude_current === false ? k : k + SELF_EXCLUSION_HEADROOM;
     const args = {
       query: fx.query,
       scope: fx.scope ?? 'conversations',
       // raw is the only mode that reliably exposes sessionId before Phase 4,
       // and stays correct after it. Keeps the harness stable across phases.
       detail_level: 'raw',
-      limit: k,
+      limit: depth,
       ...(fx.args ?? {}),
     };
 
@@ -192,7 +212,7 @@ async function main() {
       ? rows.filter((r) => r.session && !matchesPin(r.session, fx.expect_all_from_session))
       : [];
 
-    const hit = rank !== -1 && offScope.length === 0 && rows.length > 0;
+    const hit = rank !== -1 && rank < k && offScope.length === 0 && rows.length > 0;
 
     results.push({
       id: fx.id,
