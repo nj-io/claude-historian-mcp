@@ -17,6 +17,10 @@ import {
   extractContentFromMessage,
   calculateRelevanceScore,
   formatTimestamp,
+  splitQueryTerms,
+  encodeTerms,
+  bufferContainsAnyTerm,
+  stringIncludesCI,
 } from './utils.js';
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -64,12 +68,7 @@ export class ConversationParser {
 
     // Pre-compute query words ONCE for the entire file (used by both pre-filter
     // and calculateRelevanceScore). Avoids recomputing per-message.
-    const queryWords = query
-      ? query
-          .toLowerCase()
-          .split(/\s+/)
-          .filter((w: string) => w.length > 2)
-      : [];
+    const queryWords = query ? splitQueryTerms(query) : [];
 
     // Pre-compute lowercase terms for line-level pre-filter.
     // Two-phase search: cheap raw-string check on each JSONL line (~10x faster
@@ -84,11 +83,34 @@ export class ConversationParser {
     const processLine = (line: string): void => {
       if (!line.trim()) return;
 
+      // Record-type gate. Roughly a quarter of corpus bytes are records that
+      // carry no message at all — file-history-snapshot alone is ~19% — and
+      // they can never satisfy a content query. The gate is exact: embedded
+      // file content is JSON-escaped to \"message\", so a snapshot cannot
+      // false-positive on the literal.
+      const msgIdx = line.indexOf('"message"');
+      if (msgIdx === -1) return;
+
       // Line-level pre-filter: skip JSON.parse for lines that don't contain
       // any query term. This eliminates 80-95% of JSON.parse calls.
+      //
+      // Scanning starts at the message object rather than at the start of the
+      // line. Everything before it is envelope — cwd, gitBranch, version —
+      // which matched constantly: "likewiki" is a substring hit on 80.3% of
+      // lines in that project's file purely via cwd, defeating the filter for
+      // any query naming a project. Envelope-only matches already score zero
+      // and are discarded downstream, so nothing is lost by not counting them.
+      //
+      // slug is exempt: its key position is not stable relative to "message",
+      // and slug matches are a real recall path, so it is checked separately.
+      // Native lowercase beats a hand-written fold on strings — V8's string
+      // routines are well optimised, and benchmarking the alternatives on a real
+      // transcript put the char-code loop ~50% slower. Raw-byte scanning wins
+      // only where it avoids a decode, which is the file-level filter below.
       if (queryTerms.length > 0) {
-        const lineLower = line.toLowerCase();
-        if (!queryTerms.some((term) => lineLower.includes(term))) {
+        const body = line.slice(msgIdx).toLowerCase();
+        const inBody = queryTerms.some((term) => body.includes(term));
+        if (!inBody && !this.slugMatches(line, queryTerms)) {
           return;
         }
       }
@@ -142,22 +164,46 @@ export class ConversationParser {
       const fileStats = await stat(filePath);
 
       if (fileStats.size < SMALL_FILE_THRESHOLD) {
-        const content = await readFile(filePath, 'utf-8');
-        // File-level pre-filter: if query terms exist and NONE appear in the
-        // whole file, skip line splitting entirely. One toLowerCase() on the
-        // whole buffer is far cheaper than per-line toLowerCase + includes.
+        // File-level pre-filter over raw bytes. Reading as a Buffer and scanning
+        // it directly avoids both the UTF-8 decode and the full-copy allocation
+        // of `content.toLowerCase()` for files that cannot match — which is most
+        // of them. Measured across 2.32 GB: 9,940ms decoded versus 2,696ms raw,
+        // identical results. This is what makes scanning the full corpus,
+        // subagent transcripts included, cheaper than scanning half of it today.
+        const buf = await readFile(filePath);
         if (queryTerms.length > 0) {
-          const contentLower = content.toLowerCase();
-          if (!queryTerms.some((term) => contentLower.includes(term))) {
-            return messages;
+          const pats = encodeTerms(queryTerms);
+          if (pats) {
+            if (!bufferContainsAnyTerm(buf, pats)) return messages;
+          } else {
+            // Non-ASCII terms: byte folding is not valid, so take the decoded
+            // path rather than risk a false negative.
+            const lower = buf.toString('utf-8').toLowerCase();
+            if (!queryTerms.some((term) => lower.includes(term))) return messages;
           }
         }
+        const content = buf.toString('utf-8');
         const lines = content.split('\n');
         for (const line of lines) {
           processLine(line);
         }
       } else {
-        // Stream path for large files (>64KB)
+        // Large files stream, to avoid holding a 200 MB buffer per file while
+        // every project is scanned in parallel. That left them with no
+        // file-level filter at all — and they hold nearly all corpus bytes, so
+        // every query decoded and line-scanned all of them.
+        //
+        // A chunked raw-byte pre-pass fixes that: read undecoded chunks, scan
+        // them, and only fall through to the line pass if a term is present.
+        // Non-matching files — most of them, for any selective query — cost one
+        // sequential read and no decode.
+        if (queryTerms.length > 0) {
+          const pats = encodeTerms(queryTerms);
+          if (pats && !(await this.fileMayMatch(filePath, pats))) {
+            return messages;
+          }
+        }
+
         const fileStream = createReadStream(filePath, { encoding: 'utf8' });
         const rl = createInterface({
           input: fileStream,
@@ -173,6 +219,61 @@ export class ConversationParser {
     }
 
     return messages;
+  }
+
+  /**
+   * Chunked raw-byte scan of a large file for any query term.
+   *
+   * @remarks
+   * Streams undecoded chunks and tests each for the terms. Adjacent chunks
+   * overlap by the longest term minus one byte, so a term straddling a chunk
+   * boundary is still found — without an overlap this would silently drop
+   * matches, which is the one failure mode a pre-filter must never have.
+   *
+   * @returns `true` if the file may contain a term (parse it), `false` if it
+   *   definitely does not (skip it).
+   */
+  private async fileMayMatch(filePath: string, pats: Buffer[]): Promise<boolean> {
+    const overlap = Math.max(...pats.map((p) => p.length)) - 1;
+    let tail: Buffer = Buffer.alloc(0);
+
+    const stream = createReadStream(filePath, { highWaterMark: 1 << 22 });
+    try {
+      for await (const chunk of stream) {
+        const buf = chunk as Buffer;
+        const scan = tail.length > 0 ? Buffer.concat([tail, buf]) : buf;
+        if (bufferContainsAnyTerm(scan, pats)) {
+          stream.destroy();
+          return true;
+        }
+        tail = overlap > 0 ? scan.subarray(Math.max(0, scan.length - overlap)) : Buffer.alloc(0);
+      }
+    } catch {
+      // Unreadable mid-stream: fall through to the line pass rather than
+      // silently dropping the file from the result set.
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Test query terms against a record's `slug` value only.
+   *
+   * @remarks
+   * Session slugs are human-memorable names ("curried-zooming-charm") and are a
+   * real way people search. The key sits before `"message"` in some records and
+   * after it in others, so the body-region scan cannot be relied on to cover
+   * it — checking it explicitly is what keeps slug recall intact.
+   */
+  private slugMatches(line: string, terms: string[]): boolean {
+    const key = line.indexOf('"slug"');
+    if (key === -1) return false;
+    const open = line.indexOf('"', key + 6);
+    if (open === -1) return false;
+    const close = line.indexOf('"', open + 1);
+    if (close === -1) return false;
+    const slug = line.slice(open + 1, close);
+    return terms.some((term) => stringIncludesCI(slug, term));
   }
 
   // ── Context extraction ──────────────────────────────────────────────

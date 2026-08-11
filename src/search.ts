@@ -17,6 +17,7 @@ import {
   SessionInfo,
 } from './types.js';
 import {
+  splitQueryTerms,
   findProjectDirectories,
   findJsonlFiles,
   getTimeRangeFilter,
@@ -170,7 +171,7 @@ export class HistorySearchEngine {
         lowerQuery.includes('code'),
       expectsSolution:
         lowerQuery.includes('how') || lowerQuery.includes('fix') || lowerQuery.includes('solve'),
-      keywords: lowerQuery.split(/\s+/).filter((w) => w.length > 2),
+      keywords: splitQueryTerms(query),
       semanticBoosts: this.getSemanticBoosts(lowerQuery),
     };
   }
@@ -232,10 +233,7 @@ export class HistorySearchEngine {
       // boost all results from that project.
       // Use encoded dir names directly to avoid lossy decodeProjectPath
       // (which converts real hyphens to slashes, e.g. codex-mcp-historian → codex/mcp/historian)
-      const queryTermsLower = query
-        .toLowerCase()
-        .split(/\s+/)
-        .filter((w) => w.length > 2);
+      const queryTermsLower = splitQueryTerms(query);
       const matchingProjectDirs = new Set<string>();
       for (const dir of targetDirs) {
         const dirLower = dir.toLowerCase();
@@ -436,14 +434,10 @@ export class HistorySearchEngine {
   ): CompactMessage[] {
     // Hoist query term computation — was recomputed per candidate inside .map()
     // Dedup to prevent double-counting (e.g. "token progress LLM progress" counted "progress" twice)
-    const queryTerms = [
-      ...new Set(
-        query
-          .toLowerCase()
-          .split(/\s+/)
-          .filter((w) => w.length > 2),
-      ),
-    ];
+    // Must agree with the pre-filter's view of the query. When they differ,
+    // stopword hits inflate matchCount — a message containing only "the" and
+    // "did" scored the same boost as one matching every real term.
+    const queryTerms = splitQueryTerms(query);
 
     const scoredCandidates = candidates.map((msg) => {
       let score = msg.relevanceScore || 0;
@@ -2070,7 +2064,7 @@ export class HistorySearchEngine {
     content: string,
   ): number {
     const lowerQuery = query.toLowerCase();
-    const queryTerms = lowerQuery.split(/\s+/).filter((w) => w.length > 2);
+    const queryTerms = splitQueryTerms(query);
 
     let score = 0;
 
@@ -2119,7 +2113,7 @@ export class HistorySearchEngine {
       const results: CompactMessage[] = [];
       const configFiles = await findClaudeMarkdownFiles();
       const lowerQuery = query.toLowerCase();
-      const queryTerms = lowerQuery.split(/\s+/).filter((w) => w.length > 2);
+      const queryTerms = splitQueryTerms(query);
 
       for (const { path, category } of configFiles) {
         try {
@@ -2203,7 +2197,7 @@ export class HistorySearchEngine {
       const results: CompactMessage[] = [];
       const projectsPath = getClaudeProjectsPath();
       const lowerQuery = query.toLowerCase();
-      const queryTerms = lowerQuery.split(/\s+/).filter((w) => w.length > 2);
+      const queryTerms = splitQueryTerms(query);
 
       // Glob: ~/.claude/projects/*/memory/*.md
       let projectDirs: string[];
@@ -2299,7 +2293,7 @@ export class HistorySearchEngine {
       const results: CompactMessage[] = [];
       const taskFiles = await findTaskFiles();
       const lowerQuery = query.toLowerCase();
-      const queryTerms = lowerQuery.split(/\s+/).filter((w) => w.length > 2);
+      const queryTerms = splitQueryTerms(query);
 
       for (const filePath of taskFiles) {
         try {

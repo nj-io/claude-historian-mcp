@@ -117,7 +117,12 @@ class ClaudeHistorianServer {
             .optional()
             .default('all')
             .describe(
-              'Search scope: all (default), conversations, files, errors, plans, config, tasks, similar, sessions, tools, memories',
+              'What to search. "all" (default) covers conversations plus plans, config and memories. ' +
+                'The remaining scopes are NOT included in "all" and must be asked for by name: ' +
+                '"errors" (past failures and their fixes), "sessions" (browse recent sessions), ' +
+                '"tools" (tool usage patterns), "files" (history for one filepath), ' +
+                '"similar" (past queries like this one), "tasks". ' +
+                'Each scans the corpus independently, so name one rather than defaulting to "all" when you know what you want.',
             ),
           detail_level: z
             .enum(['summary', 'detailed', 'raw'])
@@ -380,23 +385,23 @@ class ClaudeHistorianServer {
 
       case 'all':
       default: {
-        // Parallel fan-out: conversations + plans + config + memories + errors + sessions + tools
-        const [
-          convResult,
-          planResult,
-          configResult,
-          memoryResult,
-          errorResult,
-          sessionResult,
-          toolResult,
-        ] = await Promise.allSettled([
+        // Fan-out over conversations plus the three cheap markdown scopes.
+        //
+        // errors, sessions and tools used to run here too. Each is an
+        // independent full-corpus pass, and their pre-filter terms are so
+        // common they barely filter — ['error','failed','exception','cannot']
+        // and ['tool_use'] match almost every line — so they cost MORE than
+        // the conversations search they were bundled with. Four concurrent
+        // passes contending on a 4-thread pool made the default scope the
+        // slowest thing the server did, by an order of magnitude.
+        //
+        // They remain available by asking for them explicitly, which is what
+        // the scope description and the server instructions now tell callers.
+        const [convResult, planResult, configResult, memoryResult] = await Promise.allSettled([
           this.universalEngine.searchConversations(query!, project, timeframe, limit),
           this.universalEngine.searchPlans(query!, limit),
           this.searchEngine.searchConfig(query!, limit),
           this.searchEngine.searchMemories(query!, limit),
-          this.universalEngine.getErrorSolutions(query!, limit),
-          this.universalEngine.getRecentSessions(limit, project),
-          this.universalEngine.getToolPatterns(query || undefined, limit),
         ]);
 
         // Merge and deduplicate results
@@ -424,43 +429,6 @@ class ClaudeHistorianServer {
         if (memoryResult.status === 'fulfilled') {
           allMessages.push(...memoryResult.value.messages);
         }
-        if (errorResult.status === 'fulfilled') {
-          for (const sol of errorResult.value.results) {
-            for (const msg of sol.solution) {
-              allMessages.push({
-                ...msg,
-                uuid: msg.uuid || `error-${sol.errorPattern}`,
-                content: `[Error: ${sol.errorPattern}] ${msg.content}`,
-                relevanceScore: (msg.relevanceScore || 0) + sol.frequency,
-              });
-            }
-          }
-        }
-        if (sessionResult.status === 'fulfilled') {
-          for (const sess of sessionResult.value.results) {
-            allMessages.push({
-              uuid: `session-${sess.session_id}`,
-              timestamp: sess.end_time ?? sess.start_time ?? '',
-              type: 'assistant',
-              content: `[Session: ${sess.project_path?.split('/').pop() || 'unknown'}] ${(sess.accomplishments || []).join(', ')}`,
-              sessionId: sess.session_id,
-              projectPath: sess.project_path ?? undefined,
-              relevanceScore: 0,
-            });
-          }
-        }
-        if (toolResult.status === 'fulfilled') {
-          for (const pat of toolResult.value.results) {
-            if (pat.successfulUsages[0]) {
-              allMessages.push({
-                ...pat.successfulUsages[0],
-                uuid: pat.successfulUsages[0].uuid || `tool-${pat.toolName}`,
-                content: `[Tool: ${pat.toolName}] ${pat.successfulUsages[0].content}`,
-              });
-            }
-          }
-        }
-
         // Deduplicate by uuid (same message can appear from multiple scopes)
         const seen = new Set<string>();
         const deduped = allMessages.filter((m) => {
@@ -469,9 +437,11 @@ class ClaudeHistorianServer {
           seen.add(key);
           return true;
         });
-        const sorted = deduped
-          .sort((a, b) => (b.relevanceScore || 0) - (a.relevanceScore || 0))
-          .slice(0, limit);
+        // Sort on the same value the formatter displays. Sorting on
+        // relevanceScore while rendering finalScore emitted rows in an order
+        // that contradicted their own printed scores (100, 89, 33, 81, 70).
+        const rank = (m: CompactMessage): number => m.finalScore ?? m.relevanceScore ?? 0;
+        const sorted = deduped.sort((a, b) => rank(b) - rank(a)).slice(0, limit);
 
         const mergedResult = {
           messages: sorted,

@@ -187,6 +187,160 @@ export async function findTaskFiles(): Promise<string[]> {
   }
 }
 
+// ── Query term extraction ──────────────────────────────────────────
+
+/**
+ * Words stripped from queries before filtering and scoring.
+ *
+ * @remarks
+ * `GENERIC_TERMS` already carries 175 low-signal words (the, and, for, with).
+ * Interrogatives were missing, and they dominate naturally-phrased questions:
+ * "why did we do the egress quota thing" carried four noise terms against two
+ * real ones. `the` alone is a substring hit on 42% of corpus lines, which
+ * defeated the pre-filter entirely.
+ */
+const QUERY_STOPWORDS = new Set<string>([
+  ...GENERIC_TERMS,
+  'why',
+  'did',
+  'how',
+  'was',
+  'were',
+  'what',
+  'when',
+  'where',
+  'which',
+  'who',
+  'this',
+  'that',
+  'these',
+  'those',
+  'thing',
+  'things',
+  'stuff',
+  'about',
+  'into',
+  'from',
+  'been',
+  'have',
+  'has',
+  'had',
+  'does',
+  'doing',
+  'done',
+]);
+
+/**
+ * Split a search query into the terms used for pre-filtering and scoring.
+ *
+ * @remarks
+ * The single source of truth for query term extraction. Pre-filtering and
+ * scoring MUST agree on what the query was — when they disagree, messages pass
+ * the filter and then score zero, or stopword hits inflate match counts.
+ *
+ * Callers should strip once at their entry point and thread the result through
+ * `preComputedQueryWords` rather than re-splitting downstream.
+ *
+ * Not for splitting message *content* — that uses different delimiters and
+ * length rules — nor for the case-preserving split in the case-aware filter,
+ * nor for `search-helpers`' similarity and keyword functions, which carry their
+ * own deliberately different vocabularies.
+ *
+ * @param query - Raw user query.
+ * @returns Deduplicated lowercase terms, stopwords removed.
+ */
+export function splitQueryTerms(query: string): string[] {
+  if (!query) return [];
+  const raw = query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+  const stripped = [...new Set(raw.filter((w) => !QUERY_STOPWORDS.has(w)))];
+
+  // An all-stopword query ("what did we do") strips to nothing. An empty term
+  // list disables the pre-filter, so every line in the corpus would be parsed
+  // and then score zero — slower than before the strip, for no results. Fall
+  // back to the unstripped terms: worse ranking, but bounded work.
+  return stripped.length > 0 ? stripped : [...new Set(raw)];
+}
+
+// ── Case-insensitive scanning without allocation ────────────────────
+
+/** True when every term is pure lowercase ASCII, so byte folding is valid. */
+function isAsciiLower(terms: string[]): boolean {
+  return terms.every((t) => /^[ -~]*$/.test(t));
+}
+
+/**
+ * Case-insensitive substring test over a raw buffer, without decoding it.
+ *
+ * @remarks
+ * The previous approach allocated `content.toLowerCase()` — a second full copy
+ * of every file — before testing. Over the corpus that dominated search cost:
+ * measured 9,940ms versus 2,696ms for this scan across 2.32 GB, identical
+ * results. Folds ASCII `A-Z` only; callers must check {@link isAsciiLower}
+ * first and fall back for non-ASCII terms.
+ */
+function bufferIncludesAscii(buf: Buffer, pat: Buffer): boolean {
+  const first = pat[0];
+  const FIRST = first >= 97 && first <= 122 ? first - 32 : first;
+  const n = buf.length;
+  const m = pat.length;
+  if (m === 0 || n < m) return false;
+
+  for (let i = 0, last = n - m; i <= last; i++) {
+    const c = buf[i];
+    if (c !== first && c !== FIRST) continue;
+    let j = 1;
+    for (; j < m; j++) {
+      let d = buf[i + j];
+      if (d >= 65 && d <= 90) d += 32;
+      if (d !== pat[j]) break;
+    }
+    if (j === m) return true;
+  }
+  return false;
+}
+
+/** Pre-encode terms once per file rather than per line. */
+export function encodeTerms(terms: string[]): Buffer[] | null {
+  if (!isAsciiLower(terms)) return null;
+  return terms.map((t) => Buffer.from(t, 'ascii'));
+}
+
+/** True when the buffer contains any term, case-insensitively. */
+export function bufferContainsAnyTerm(buf: Buffer, pats: Buffer[]): boolean {
+  return pats.some((p) => bufferIncludesAscii(buf, p));
+}
+
+/**
+ * Case-insensitive substring test over a string region, without allocating.
+ *
+ * @param s - Haystack.
+ * @param term - Lowercase ASCII needle.
+ * @param from - Index to start scanning from.
+ */
+export function stringIncludesCI(s: string, term: string, from = 0): boolean {
+  const m = term.length;
+  const n = s.length;
+  if (m === 0 || n - from < m) return false;
+  const first = term.charCodeAt(0);
+  const FIRST = first >= 97 && first <= 122 ? first - 32 : first;
+
+  for (let i = from, last = n - m; i <= last; i++) {
+    const c = s.charCodeAt(i);
+    if (c !== first && c !== FIRST) continue;
+    let j = 1;
+    for (; j < m; j++) {
+      let d = s.charCodeAt(i + j);
+      if (d >= 65 && d <= 90) d += 32;
+      if (d !== term.charCodeAt(j)) break;
+    }
+    if (j === m) return true;
+  }
+  return false;
+}
+
 // ── Path encoding ──────────────────────────────────────────────────
 
 /**
@@ -272,7 +426,10 @@ export async function findJsonlFiles(projectDir: string): Promise<string[]> {
     const projectsPath = getClaudeProjectsPath();
     const fullPath = join(projectsPath, projectDir);
     const entries = await readdir(fullPath);
-    const jsonlFiles = entries.filter((file) => file.endsWith('.jsonl'));
+    // journal.jsonl is workflow bookkeeping — no message records, so it can
+    // never satisfy a content query. Excluding it by name is cheaper than
+    // gating it line by line, and keeps it out of session listings.
+    const jsonlFiles = entries.filter((file) => file.endsWith('.jsonl') && file !== 'journal.jsonl');
 
     // Get mtime for each file and sort by most recent first - fixes #70
     const filesWithStats = await Promise.all(
@@ -405,8 +562,7 @@ export function calculateRelevanceScore(
   if (!content) return 0;
 
   const lowerContent = content.toLowerCase();
-  const lowerQuery = query.toLowerCase();
-  const queryWords = preComputedQueryWords ?? lowerQuery.split(/\s+/).filter((w) => w.length > 2);
+  const queryWords = preComputedQueryWords ?? splitQueryTerms(query);
 
   // Split content into words ONCE — matchesTechTerm was re-splitting per call
   const contentWords = content.split(/[\s.,;:!?()[\]{}'"<>]+/);
