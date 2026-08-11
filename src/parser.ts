@@ -20,6 +20,7 @@ import {
   splitQueryTerms,
   encodeTerms,
   bufferContainsAnyTerm,
+  indexOfAscii,
   stringIncludesCI,
 } from './utils.js';
 
@@ -80,9 +81,7 @@ export class ConversationParser {
     // skip irrelevant lines without affecting scoring or context extraction.
     const queryTerms = preFilterTerms || queryWords;
 
-    let lineNo = 0;
-    const processLine = (line: string): void => {
-      lineNo++;
+    const processLine = (line: string, lineNo: number): void => {
       if (!line.trim()) return;
 
       // Record-type gate. Roughly a quarter of corpus bytes are records that
@@ -186,21 +185,20 @@ export class ConversationParser {
         // identical results. This is what makes scanning the full corpus,
         // subagent transcripts included, cheaper than scanning half of it today.
         const buf = await readFile(filePath);
-        if (queryTerms.length > 0) {
-          const pats = encodeTerms(queryTerms);
-          if (pats) {
-            if (!bufferContainsAnyTerm(buf, pats)) return messages;
-          } else {
+        const pats = queryTerms.length > 0 ? encodeTerms(queryTerms) : null;
+
+        if (pats) {
+          // Locate candidate lines in the raw bytes and decode only those.
+          this.processMatchingLines(buf, pats, processLine);
+        } else {
+          if (queryTerms.length > 0) {
             // Non-ASCII terms: byte folding is not valid, so take the decoded
             // path rather than risk a false negative.
             const lower = buf.toString('utf-8').toLowerCase();
             if (!queryTerms.some((term) => lower.includes(term))) return messages;
           }
-        }
-        const content = buf.toString('utf-8');
-        const lines = content.split('\n');
-        for (const line of lines) {
-          processLine(line);
+          const lines = buf.toString('utf-8').split('\n');
+          for (let i = 0; i < lines.length; i++) processLine(lines[i], i + 1);
         }
       } else {
         // Large files stream, to avoid holding a 200 MB buffer per file while
@@ -212,21 +210,22 @@ export class ConversationParser {
         // them, and only fall through to the line pass if a term is present.
         // Non-matching files — most of them, for any selective query — cost one
         // sequential read and no decode.
-        if (queryTerms.length > 0) {
-          const pats = encodeTerms(queryTerms);
-          if (pats && !(await this.fileMayMatch(filePath, pats))) {
-            return messages;
-          }
+        const pats = queryTerms.length > 0 ? encodeTerms(queryTerms) : null;
+        if (pats) {
+          if (!(await this.fileMayMatch(filePath, pats))) return messages;
+          // The file matches somewhere. Read it once and decode only the lines
+          // that carry a term — streaming every line decodes the whole file to
+          // find, typically, a handful of records.
+          this.processMatchingLines(await readFile(filePath), pats, processLine);
+          return messages;
         }
 
         const fileStream = createReadStream(filePath, { encoding: 'utf8' });
-        const rl = createInterface({
-          input: fileStream,
-          crlfDelay: Infinity,
-        });
+        const rl = createInterface({ input: fileStream, crlfDelay: Infinity });
 
+        let streamLineNo = 0;
         for await (const line of rl) {
-          processLine(line);
+          processLine(line, ++streamLineNo);
         }
       }
     } catch (error) {
@@ -234,6 +233,64 @@ export class ConversationParser {
     }
 
     return messages;
+  }
+
+  /**
+   * Decode and process only the lines that contain a query term.
+   *
+   * @remarks
+   * Decoding a whole file and splitting it dominated search cost: profiling a
+   * corpus-wide query showed 940 matching files holding 1.74 GB being decoded
+   * into 408,691 lines, of which 5,211 were ultimately parsed. The terms are
+   * located in the raw buffer instead, each hit expanded to its enclosing line,
+   * and only those lines decoded.
+   *
+   * Line numbers are tracked by counting newlines forward from the previous
+   * hit, so `sourceLine` stays accurate without decoding the skipped regions.
+   *
+   * Semantics are unchanged: a line found here still runs the full record gate,
+   * envelope-scoped match and slug check, so candidates rejected by those rules
+   * are rejected identically.
+   */
+  private processMatchingLines(
+    buf: Buffer,
+    pats: Buffer[],
+    processLine: (line: string, lineNo: number) => void,
+  ): void {
+    const positions: number[] = [];
+    for (const pat of pats) {
+      let from = 0;
+      for (;;) {
+        const at = indexOfAscii(buf, pat, from);
+        if (at === -1) break;
+        positions.push(at);
+        from = at + 1;
+      }
+    }
+    if (positions.length === 0) return;
+    positions.sort((a, b) => a - b);
+
+    const NL = 0x0a;
+    let lastLineEnd = -1;
+    let scanned = 0; // bytes whose newlines are already counted
+    let lineNo = 1;
+
+    for (const pos of positions) {
+      let start = buf.lastIndexOf(NL, pos);
+      start = start === -1 ? 0 : start + 1;
+      if (start <= lastLineEnd) continue; // same line as a previous hit
+
+      for (let i = scanned; i < start; i++) {
+        if (buf[i] === NL) lineNo++;
+      }
+      scanned = start;
+
+      let end = buf.indexOf(NL, pos);
+      if (end === -1) end = buf.length;
+      lastLineEnd = end;
+
+      processLine(buf.toString('utf-8', start, end), lineNo);
+    }
   }
 
   /**

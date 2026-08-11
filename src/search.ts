@@ -20,6 +20,9 @@ import {
 import {
   splitQueryTerms,
   projectMatches,
+  mapWithConcurrency,
+  FILE_CONCURRENCY,
+  findJsonlFilesRecursive,
   findProjectDirectories,
   findJsonlFiles,
   getTimeRangeFilter,
@@ -221,7 +224,9 @@ export class HistorySearchEngine {
         timeFilter,
       );
       const relevant = messages.filter((m) => this.isHighlyRelevant(m, query, analysis));
-      const top = this.selectTopRelevantResults(relevant, query, analysis, limit);
+      // No roll-up here: the caller asked to look inside one conversation, so
+      // individual hits with agent attribution are what they want.
+      const top = this.selectTopRelevantResults(relevant, query, analysis).slice(0, limit);
       return {
         messages: top,
         totalResults: relevant.length,
@@ -286,7 +291,10 @@ export class HistorySearchEngine {
       }
 
       // Intelligent relevance scoring and selection with quality guarantee
-      const topRelevant = this.selectTopRelevantResults(candidates, query, analysis, limit);
+      // Roll up delegated work before limiting, so a fan-out of agents costs
+      // one result slot rather than all of them.
+      const scored = this.selectTopRelevantResults(candidates, query, analysis);
+      const topRelevant = this.rollUpSidechains(scored).slice(0, limit);
 
       // Quality gate: Only return results that meet minimum value threshold
       const qualityResults = topRelevant.filter(
@@ -351,22 +359,23 @@ export class HistorySearchEngine {
     timeFilter: ((timestamp: string) => boolean) | undefined,
   ): Promise<CompactMessage[]> {
     try {
-      const jsonlFiles = await findJsonlFiles(projectDir);
+      // Conversation search is the one caller that wants subagent transcripts.
+      // Session listing and session-by-id lookup must not see them — see
+      // findJsonlFilesRecursive for why.
+      const jsonlFiles = await findJsonlFilesRecursive(projectDir);
 
-      // All files in parallel — no sequential loop, no break, no cap.
-      // libuv thread pool (4 threads) naturally throttles I/O. Parser
-      // pre-filters eliminate 80-95% of data before objects are created.
-      // Same pattern as findFileContext (line 945).
-      const fileResults = await Promise.allSettled(
-        jsonlFiles.map((file) => this.processJsonlFile(projectDir, file, query, timeFilter)),
+      // Bounded fan-out. Issuing every file at once was fine at 64 files per
+      // project; with subagent transcripts included one project holds 1,282,
+      // and flooding the thread pool made each file's pre-filter wait behind
+      // all the others instead of skipping and moving on.
+      const fileResults = await mapWithConcurrency(jsonlFiles, FILE_CONCURRENCY, (file) =>
+        this.processJsonlFile(projectDir, file, query, timeFilter),
       );
 
       const messages: CompactMessage[] = [];
       for (const result of fileResults) {
-        if (result.status === 'fulfilled') {
-          const relevant = result.value.filter((msg) => (msg.relevanceScore || 0) >= 0.5);
-          messages.push(...relevant);
-        }
+        if (!result) continue;
+        messages.push(...result.filter((msg) => (msg.relevanceScore || 0) >= 0.5));
       }
       return messages;
     } catch (error) {
@@ -456,11 +465,18 @@ export class HistorySearchEngine {
     }
   }
 
+  /**
+   * Score, rank and deduplicate candidates.
+   *
+   * @remarks
+   * Returns the full ranked set rather than truncating: roll-up runs after
+   * this, and collapsing subagent groups is only correct with every hit in
+   * hand. Callers apply their own limit.
+   */
   private selectTopRelevantResults(
     candidates: CompactMessage[],
     query: string,
     analysis: QueryAnalysis,
-    limit: number,
   ): CompactMessage[] {
     // Hoist query term computation — was recomputed per candidate inside .map()
     // Dedup to prevent double-counting (e.g. "token progress LLM progress" counted "progress" twice)
@@ -529,7 +545,7 @@ export class HistorySearchEngine {
 
     const deduped = this.intelligentDeduplicate(sorted);
 
-    return deduped.slice(0, limit);
+    return deduped;
   }
 
   private messageMatchesSemanticType(message: CompactMessage, type: string): boolean {
@@ -565,6 +581,68 @@ export class HistorySearchEngine {
       default:
         return false;
     }
+  }
+
+  /**
+   * Collapse subagent hits into one row per parent session.
+   *
+   * @remarks
+   * Subagent transcripts carry their PARENT's sessionId, so without this a
+   * fan-out floods the results: one session in this corpus spawned 1,239
+   * agents, and a broad query against it would return page after page of
+   * near-identical rows from agents working the same problem.
+   *
+   * The best-scoring hit represents the group and names the agents behind it,
+   * so the roll-up adds attribution rather than hiding it. The agent list is
+   * capped for the same reason the roll-up exists.
+   *
+   * Parent-session messages are never collapsed — only delegated work is.
+   * Session-scoped search skips this entirely: there the caller has asked to
+   * see inside one conversation, so per-message hits with agent attribution are
+   * the point.
+   */
+  private rollUpSidechains(messages: CompactMessage[]): CompactMessage[] {
+    const MAX_AGENTS_LISTED = 5;
+    const direct: CompactMessage[] = [];
+    const bySession = new Map<string, CompactMessage[]>();
+
+    for (const msg of messages) {
+      if (!msg.isSidechain) {
+        direct.push(msg);
+        continue;
+      }
+      const key = msg.sessionId || msg.sourceFile || '';
+      const group = bySession.get(key);
+      if (group) group.push(msg);
+      else bySession.set(key, [msg]);
+    }
+
+    const rolled: CompactMessage[] = [];
+    for (const group of bySession.values()) {
+      const best = group.reduce((a, b) =>
+        (b.finalScore ?? b.relevanceScore ?? 0) > (a.finalScore ?? a.relevanceScore ?? 0) ? b : a,
+      );
+
+      const hitsByAgent = new Map<string, number>();
+      for (const msg of group) {
+        const id = msg.agentId ?? 'unknown';
+        hitsByAgent.set(id, (hitsByAgent.get(id) ?? 0) + 1);
+      }
+
+      rolled.push({
+        ...best,
+        rolledUpHits: group.length,
+        contributingAgents: [...hitsByAgent.entries()]
+          .map(([agentId, hits]) => ({ agentId, hits }))
+          .sort((a, b) => b.hits - a.hits)
+          .slice(0, MAX_AGENTS_LISTED),
+      });
+    }
+
+    return [...direct, ...rolled].sort(
+      (a, b) =>
+        (b.finalScore ?? b.relevanceScore ?? 0) - (a.finalScore ?? a.relevanceScore ?? 0),
+    );
   }
 
   private intelligentDeduplicate(messages: CompactMessage[]): CompactMessage[] {

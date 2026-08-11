@@ -113,6 +113,10 @@ export interface CompactMessage {
   agentId?: string;
   /** True when this message came from a subagent transcript. */
   isSidechain?: boolean;
+  /** Agents that contributed hits, when this row represents rolled-up subagent work. */
+  contributingAgents?: { agentId: string; hits: number }[];
+  /** Number of subagent hits collapsed into this row. */
+  rolledUpHits?: number;
   relevanceScore?: number;
   /** Combined score after all boost passes. */
   finalScore?: number;

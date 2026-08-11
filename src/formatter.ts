@@ -341,6 +341,14 @@ export class BeautifulFormatter {
         session: msg.sessionId || null,
         source: msg.sourceLine ? `${msg.sourceFile}:${msg.sourceLine}` : (msg.sourceFile ?? null),
         agent: msg.agentId ?? undefined,
+        // Delegated work is collapsed to one row per session; name the agents
+        // behind it so the roll-up is legible rather than lossy.
+        via: msg.contributingAgents?.length
+          ? {
+              hits: msg.rolledUpHits,
+              agents: msg.contributingAgents.map((a) => `${a.agentId} x${a.hits}`),
+            }
+          : undefined,
         ctx: isSummary ? undefined : msg.context || null,
       })),
     };

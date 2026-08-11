@@ -21,6 +21,9 @@ import { ClaudeMessage, MessageContentBlock } from './types.js';
 const DIR_CACHE_TTL = 30_000;
 const projectDirCache: { dirs: string[]; ts: number } = { dirs: [], ts: 0 };
 const jsonlFileCache = new Map<string, { files: string[]; ts: number }>();
+/** Separate cache: recursive listings include subagent transcripts, so the two
+ * must never be served interchangeably. */
+const recursiveFileCache = new Map<string, { files: string[]; ts: number }>();
 
 // ── Path resolution ────────────────────────────────────────────────
 
@@ -186,6 +189,47 @@ export async function findTaskFiles(): Promise<string[]> {
     return [];
   }
 }
+
+/**
+ * Map over items with a bounded number of concurrent operations.
+ *
+ * @remarks
+ * `Promise.allSettled` over every file in a project was tolerable at 64 files.
+ * Once subagent transcripts are included one project holds 1,282, and the
+ * corpus 2,745 — issuing them all at once floods the libuv thread pool, so
+ * every read queues behind every other and the file-level pre-filter loses its
+ * ability to finish early and move on. Bounding the fan-out keeps the pool
+ * saturated without the queueing.
+ *
+ * Rejections resolve to `undefined` rather than failing the batch, matching
+ * `allSettled` semantics at the call sites this replaces.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<(R | undefined)[]> {
+  const results: (R | undefined)[] = Array.from({ length: items.length });
+  let next = 0;
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      try {
+        results[index] = await fn(items[index]);
+      } catch {
+        results[index] = undefined;
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/** Concurrent file reads per project. Tuned against the libuv thread pool. */
+export const FILE_CONCURRENCY = 24;
 
 // ── Session and project identity ────────────────────────────────────
 
@@ -442,6 +486,33 @@ export function bufferContainsAnyTerm(buf: Buffer, pats: Buffer[]): boolean {
 }
 
 /**
+ * Index of the next case-insensitive occurrence of an ASCII pattern.
+ *
+ * @param from - Byte offset to start searching from.
+ * @returns Byte offset of the match, or -1.
+ */
+export function indexOfAscii(buf: Buffer, pat: Buffer, from = 0): number {
+  const first = pat[0];
+  const FIRST = first >= 97 && first <= 122 ? first - 32 : first;
+  const n = buf.length;
+  const m = pat.length;
+  if (m === 0 || n < m) return -1;
+
+  for (let i = Math.max(0, from), last = n - m; i <= last; i++) {
+    const c = buf[i];
+    if (c !== first && c !== FIRST) continue;
+    let j = 1;
+    for (; j < m; j++) {
+      let d = buf[i + j];
+      if (d >= 65 && d <= 90) d += 32;
+      if (d !== pat[j]) break;
+    }
+    if (j === m) return i;
+  }
+  return -1;
+}
+
+/**
  * Case-insensitive substring test over a string region, without allocating.
  *
  * @param s - Haystack.
@@ -579,6 +650,69 @@ export async function findJsonlFiles(projectDir: string): Promise<string[]> {
     console.error(`Error finding JSONL files in ${projectDir}:`, error);
     return [];
   }
+}
+
+/**
+ * List session files in a project INCLUDING subagent transcripts.
+ *
+ * @remarks
+ * Subagent transcripts live under `<sessionId>/subagents/`, both directly and
+ * beneath a `workflows/wf_...` subdirectory. They are the bulk of the corpus —
+ * roughly 2,700 files and more than half its bytes — and were entirely
+ * unreachable, so any work done by a delegated agent could not be found.
+ *
+ * Deliberately separate from {@link findJsonlFiles} rather than replacing it.
+ * The subagent directory is named after its parent session, so a recursive
+ * listing contains relative paths that begin with the session id. Callers that
+ * identify a session by prefix (`files.find(f => f.startsWith(sessionId))`) or
+ * that treat one file as one session would silently resolve to an agent
+ * transcript instead. Only search opts in.
+ *
+ * @returns Paths relative to the project directory, most recently modified first.
+ */
+export async function findJsonlFilesRecursive(projectDir: string): Promise<string[]> {
+  const now = Date.now();
+  const cached = recursiveFileCache.get(projectDir);
+  if (cached && now - cached.ts < DIR_CACHE_TTL) return cached.files;
+
+  const projectsPath = getClaudeProjectsPath();
+  const root = join(projectsPath, projectDir);
+  const found: { file: string; mtime: number }[] = [];
+
+  const walk = async (dir: string, relative: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    await Promise.all(
+      entries.map(async (entry) => {
+        const abs = join(dir, entry.name);
+        const rel = relative ? `${relative}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          await walk(abs, rel);
+        } else if (entry.name.endsWith('.jsonl') && entry.name !== 'journal.jsonl') {
+          try {
+            found.push({ file: rel, mtime: (await stat(abs)).mtimeMs });
+          } catch {
+            found.push({ file: rel, mtime: 0 });
+          }
+        }
+      }),
+    );
+  };
+
+  try {
+    await walk(root, '');
+  } catch (error) {
+    console.error(`Error walking ${projectDir}:`, error);
+    return [];
+  }
+
+  const files = found.sort((a, b) => b.mtime - a.mtime).map((f) => f.file);
+  recursiveFileCache.set(projectDir, { files, ts: now });
+  return files;
 }
 
 // ── Message extraction ─────────────────────────────────────────────
