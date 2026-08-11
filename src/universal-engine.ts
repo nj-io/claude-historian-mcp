@@ -25,6 +25,7 @@ import {
   CompactSummaryData,
   TranscriptEntry,
   TranscriptResult,
+  SessionScope,
 } from './types.js';
 import { findProjectDirectories, getClaudeProjectsPath } from './utils.js';
 
@@ -95,6 +96,7 @@ export class UniversalHistorySearchEngine {
     project?: string,
     timeframe?: string,
     limit?: number,
+    sessionScope?: SessionScope,
   ): Promise<UniversalSearchResult> {
     await this.initialize();
 
@@ -103,6 +105,7 @@ export class UniversalHistorySearchEngine {
       project,
       timeframe,
       limit,
+      sessionScope,
     );
 
     return {

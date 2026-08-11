@@ -260,3 +260,16 @@ export interface WorkflowStep {
   context: string;
   messages: CompactMessage[];
 }
+
+/**
+ * A resolved session file, used to restrict a search to one conversation.
+ *
+ * @remarks
+ * Carries the concrete file rather than an id so the search path can skip
+ * corpus discovery entirely.
+ */
+export interface SessionScope {
+  sessionId: string;
+  projectDir: string;
+  filename: string;
+}

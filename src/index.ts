@@ -18,6 +18,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
+import { resolveSession, getCurrentProjectDir } from './utils.js';
+import { SessionScope } from './types.js';
+
 import { BeautifulFormatter } from './formatter.js';
 import { HistorySearchEngine } from './search.js';
 import { CompactMessage } from './types.js';
@@ -134,7 +137,24 @@ class ClaudeHistorianServer {
             .optional()
             .default(10)
             .describe('Maximum number of results (default: 10)'),
-          project: z.string().optional().describe('Optional project name to filter results'),
+          session_id: z
+            .string()
+            .optional()
+            .describe(
+              'Restrict the search to a single session. Use "current" to search THIS conversation\'s ' +
+                'own history — that reads one file instead of the whole corpus, so it returns in ' +
+                'milliseconds rather than seconds, and it is the right choice for "what did we discuss ' +
+                'earlier" or "what did I say about X before". Also accepts a full session id or a short ' +
+                'prefix. Omit to search every session.',
+            ),
+          project: z
+            .string()
+            .optional()
+            .describe(
+              'Restrict the search to one project. Use "current" for the project this server was ' +
+                'launched from, a bare name like "likewiki", or an absolute path. Cheaper than ' +
+                'searching everything when you know where the answer lives. Omit to search all projects.',
+            ),
           filepath: z.string().optional().describe('File path for scope: "files"'),
           timeframe: z.string().optional().describe('Time range filter (today, week, month)'),
         },
@@ -167,7 +187,11 @@ class ClaudeHistorianServer {
         title: 'Inspect Session',
         description: 'Get intelligent summary of a conversation session with key insights',
         inputSchema: {
-          session_id: z.string().describe('Session ID to summarize'),
+          session_id: z
+            .string()
+            .describe(
+              'Session ID, short prefix, or "current" for the session calling this server.',
+            ),
           detail_level: z
             .enum(['summary', 'detailed', 'raw'])
             .optional()
@@ -219,7 +243,9 @@ class ClaudeHistorianServer {
             .optional()
             .default('latest')
             .describe(
-              'Session ID, short prefix, or "latest" (default). Tip: pass process.env.CLAUDE_SESSION_ID when available.',
+              'Session ID, short prefix, "current" for the session calling this server, or "latest" ' +
+                'for the most recently modified session. Prefer "current": "latest" resolves by ' +
+                'modification time, which with several sessions open can be a different conversation.',
             ),
           format: z
             .enum(['text', 'json'])
@@ -270,9 +296,34 @@ class ClaudeHistorianServer {
     const query = args.query as string | undefined;
     const limit = (args.limit as number) || 10;
     const detailLevel = (args.detail_level as string) || 'summary';
-    const project = args.project as string | undefined;
     const filepath = args.filepath as string | undefined;
     const timeframe = args.timeframe as string | undefined;
+
+    // "current" resolves from the environment this server was launched with.
+    // Unresolvable is an explicit error, never a guess — see resolveSession.
+    let project = args.project as string | undefined;
+    if (project?.toLowerCase() === 'current') {
+      const dir = getCurrentProjectDir();
+      if (!dir) {
+        throw new Error(
+          'project:"current" is unavailable: CLAUDE_PROJECT_DIR is not set for this server. ' +
+            'Pass a project name or path explicitly.',
+        );
+      }
+      project = dir;
+    }
+
+    let sessionScope: SessionScope | undefined;
+    const sessionArg = args.session_id as string | undefined;
+    if (sessionArg) {
+      const resolved = await resolveSession(sessionArg);
+      if (resolved.error) throw new Error(resolved.error);
+      sessionScope = {
+        sessionId: resolved.sessionId!,
+        projectDir: resolved.projectDir!,
+        filename: resolved.filename!,
+      };
+    }
 
     // Validate: most scopes require a query
     const queryRequired = !['sessions', 'tools', 'files'].includes(scope);
@@ -287,6 +338,7 @@ class ClaudeHistorianServer {
           project,
           timeframe,
           limit,
+          sessionScope,
         );
         const text = this.formatter.formatSearchConversations(result.results, detailLevel, limit);
         return { content: [{ type: 'text', text }] };
@@ -398,7 +450,7 @@ class ClaudeHistorianServer {
         // They remain available by asking for them explicitly, which is what
         // the scope description and the server instructions now tell callers.
         const [convResult, planResult, configResult, memoryResult] = await Promise.allSettled([
-          this.universalEngine.searchConversations(query!, project, timeframe, limit),
+          this.universalEngine.searchConversations(query!, project, timeframe, limit, sessionScope),
           this.universalEngine.searchPlans(query!, limit),
           this.searchEngine.searchConfig(query!, limit),
           this.searchEngine.searchMemories(query!, limit),
@@ -459,12 +511,19 @@ class ClaudeHistorianServer {
   private async handleInspect(
     args: Record<string, unknown>,
   ): Promise<{ content: { type: 'text'; text: string }[] }> {
-    const sessionId = args.session_id as string;
+    let sessionId = args.session_id as string;
     const maxMessages = (args.max_messages as number) || 10;
     const focus = (args.focus as string) || 'all';
 
     if (!sessionId) {
       throw new Error('session_id is required');
+    }
+
+    // "current" is exact; "latest" would be a modification-time guess.
+    if (sessionId.toLowerCase() === 'current') {
+      const resolved = await resolveSession('current');
+      if (resolved.error) throw new Error(resolved.error);
+      sessionId = resolved.sessionId!;
     }
 
     const result = await this.universalEngine.generateCompactSummary(sessionId, maxMessages, focus);
@@ -493,10 +552,18 @@ class ClaudeHistorianServer {
   private async handleTranscript(
     args: Record<string, unknown>,
   ): Promise<{ content: { type: 'text'; text: string }[] }> {
-    const sessionId = (args.session_id as string) || 'latest';
+    let sessionId = (args.session_id as string) || 'latest';
     const format = (args.format as string) || 'text';
     const maxMessages = args.max_messages as number | undefined;
     const latest = args.latest as number | undefined;
+
+    // "current" is exact; "latest" resolves by modification time and can land
+    // on a different live conversation when several sessions are open.
+    if (sessionId.toLowerCase() === 'current') {
+      const resolved = await resolveSession('current');
+      if (resolved.error) throw new Error(resolved.error);
+      sessionId = resolved.sessionId!;
+    }
 
     const result = await this.universalEngine.getSessionTranscript(sessionId);
 

@@ -187,6 +187,134 @@ export async function findTaskFiles(): Promise<string[]> {
   }
 }
 
+// ── Session and project identity ────────────────────────────────────
+
+/**
+ * The session this server process was launched from, if known.
+ *
+ * @remarks
+ * Claude Code exports `CLAUDE_CODE_SESSION_ID` into each MCP server it spawns,
+ * one server per session, so this identifies the caller exactly. Note the name:
+ * `CLAUDE_SESSION_ID` does not exist.
+ *
+ * It is captured at spawn and never refreshed. After `/clear` or a resume the
+ * CLI rotates to a new session file while this value keeps pointing at the old
+ * one — undetectable from here when that old file still exists. Roughly 40% of
+ * long-lived server processes hold an id whose file is already gone.
+ */
+export function getCurrentSessionId(): string | undefined {
+  return process.env.CLAUDE_CODE_SESSION_ID || undefined;
+}
+
+/** The project directory this server process was launched from, if known. */
+export function getCurrentProjectDir(): string | undefined {
+  return process.env.CLAUDE_PROJECT_DIR || undefined;
+}
+
+/** Outcome of resolving a `session_id` argument to a concrete session. */
+export interface SessionResolution {
+  sessionId?: string;
+  /** Encoded project directory holding the session file. */
+  projectDir?: string;
+  filename?: string;
+  /** Present when resolution failed; safe to surface to the caller. */
+  error?: string;
+}
+
+/**
+ * Resolve a session argument — a full id, a short prefix, or `"current"` — to
+ * the session file that backs it.
+ *
+ * @remarks
+ * Resolution searches every project directory, because worktrees place session
+ * files under encoded directories the caller cannot predict.
+ *
+ * Failure is explicit and never guesses. Falling back to the most recently
+ * modified file was considered and rejected: with many sessions open at once
+ * the newest file in a project routinely belongs to a *different* live session,
+ * so the guess would hand one conversation's transcript to another — wrong
+ * results, and a disclosure of content the caller never asked for.
+ */
+export async function resolveSession(argument: string): Promise<SessionResolution> {
+  const wantsCurrent = argument.toLowerCase() === 'current';
+  const target = wantsCurrent ? getCurrentSessionId() : argument;
+
+  if (wantsCurrent && !target) {
+    return {
+      error:
+        'No current session: CLAUDE_CODE_SESSION_ID is not set for this server. ' +
+        'Pass an explicit session_id, or use scope:"sessions" to list recent sessions.',
+    };
+  }
+  if (!target) return { error: 'session_id was empty.' };
+
+  const needle = target.toLowerCase();
+  const projectDirs = await findProjectDirectories();
+  const matches: { projectDir: string; filename: string; sessionId: string }[] = [];
+
+  for (const projectDir of projectDirs) {
+    for (const filename of await findJsonlFiles(projectDir)) {
+      const id = filename.replace(/\.jsonl$/, '');
+      if (id.toLowerCase().startsWith(needle)) {
+        matches.push({ projectDir, filename, sessionId: id });
+      }
+    }
+  }
+
+  if (matches.length === 0) {
+    return {
+      error: wantsCurrent
+        ? `No transcript found for the current session (${target}). ` +
+          'The session may have been cleared or resumed since this server started. ' +
+          'Pass an explicit session_id, or use scope:"sessions" to list recent sessions.'
+        : `No session matches "${argument}". Use scope:"sessions" to list recent sessions.`,
+    };
+  }
+
+  // An exact id beats prefix candidates; otherwise ambiguity is reported rather
+  // than silently resolved to one of several possible conversations.
+  const exact = matches.find((m) => m.sessionId.toLowerCase() === needle);
+  if (!exact && matches.length > 1) {
+    const candidates = matches
+      .slice(0, 5)
+      .map((m) => m.sessionId)
+      .join(', ');
+    return {
+      error:
+        `"${argument}" matches ${matches.length} sessions. Use a longer prefix. ` +
+        `Candidates: ${candidates}${matches.length > 5 ? ', ...' : ''}`,
+    };
+  }
+
+  const hit = exact ?? matches[0];
+  return { sessionId: hit.sessionId, projectDir: hit.projectDir, filename: hit.filename };
+}
+
+/**
+ * Match a project filter against an encoded project directory name.
+ *
+ * @remarks
+ * Accepts an absolute path (encoded and compared exactly — this is how
+ * `project: "current"` resolves), or a bare name matched as a path-segment
+ * suffix. The suffix arm is required, not a nicety: `"claude-historian-mcp"`
+ * is never equal to `-Users-neil-dev-claude-historian-mcp`, so exact-only
+ * matching would return nothing for every name-based filter.
+ *
+ * Bare substring matching was what it replaced, and it silently matched
+ * everything: `"-Users-neil"` is a substring of every sibling project.
+ */
+export function projectMatches(encodedDir: string, filter: string): boolean {
+  if (!filter) return true;
+  const dir = encodedDir.toLowerCase();
+
+  if (filter.startsWith('/')) {
+    return dir === encodeProjectPath(filter).toLowerCase();
+  }
+
+  const name = filter.replace(/\//g, '-').toLowerCase().replace(/^-+/, '');
+  return dir === `-${name}` || dir.endsWith(`-${name}`);
+}
+
 // ── Query term extraction ──────────────────────────────────────────
 
 /**

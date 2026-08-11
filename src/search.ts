@@ -15,9 +15,11 @@ import {
   PlanResult,
   QueryAnalysis,
   SessionInfo,
+  SessionScope,
 } from './types.js';
 import {
   splitQueryTerms,
+  projectMatches,
   findProjectDirectories,
   findJsonlFiles,
   getTimeRangeFilter,
@@ -124,8 +126,14 @@ export class HistorySearchEngine {
     projectFilter?: string,
     timeframe?: string,
     limit: number = 15, // Default to 15 for better coverage
+    sessionScope?: SessionScope,
   ): Promise<SearchResult> {
-    const cacheKey = `search|${query}|${projectFilter ?? ''}|${timeframe ?? ''}|${limit}`;
+    // Every scoping input belongs in the key. Omitting one serves another
+    // scope's results for the cache lifetime — a session-scoped query returned
+    // a whole-corpus result set in 11ms because session was not part of it.
+    const cacheKey =
+      `search|${query}|${projectFilter ?? ''}|${timeframe ?? ''}|${limit}` +
+      `|${sessionScope?.projectDir ?? ''}/${sessionScope?.filename ?? ''}`;
     const cached = this.getCached<SearchResult>(cacheKey);
     if (cached) return cached;
 
@@ -144,6 +152,7 @@ export class HistorySearchEngine {
         startTime,
         projectFilter,
         timeframe,
+        sessionScope,
       );
       this.setCache(cacheKey, result);
       return result;
@@ -197,8 +206,29 @@ export class HistorySearchEngine {
     startTime: number,
     projectFilter?: string,
     timeframe?: string,
+    sessionScope?: SessionScope,
   ): Promise<SearchResult> {
     const timeFilter = getTimeRangeFilter(timeframe);
+
+    // Session scope short-circuits discovery entirely: one known file instead
+    // of the whole corpus. This is the difference between milliseconds and
+    // seconds, and it is the common case for "what did we discuss earlier".
+    if (sessionScope) {
+      const messages = await this.processJsonlFile(
+        sessionScope.projectDir,
+        sessionScope.filename,
+        query,
+        timeFilter,
+      );
+      const relevant = messages.filter((m) => this.isHighlyRelevant(m, query, analysis));
+      const top = this.selectTopRelevantResults(relevant, query, analysis, limit);
+      return {
+        messages: top,
+        totalResults: relevant.length,
+        searchQuery: query,
+        executionTime: Date.now() - startTime,
+      };
+    }
 
     try {
       const projectDirs = await findProjectDirectories();
@@ -218,7 +248,7 @@ export class HistorySearchEngine {
 
       // Search all projects — no artificial scope limits
       const targetDirs = projectFilter
-        ? expandedDirs.filter((dir) => dir.includes(projectFilter))
+        ? expandedDirs.filter((dir) => projectMatches(dir, projectFilter))
         : expandedDirs;
 
       // Parallel processing with quality threshold
