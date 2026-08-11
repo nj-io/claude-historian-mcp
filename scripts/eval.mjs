@@ -16,6 +16,17 @@
  * deliberately absent: it is not measurable without labelled judgements for
  * every query x result pair.
  *
+ * KNOWN RANKING WEAKNESS, surfaced by this harness and not yet addressed:
+ * scores tie pervasively and nothing caps how much of a result set one session
+ * or one file may occupy. A phrase query returned 12 of its top 15 hits at
+ * exactly 57.2, and a subagent query was crowded out entirely by 60+
+ * identically-scored messages from a single parent transcript. Ordering among
+ * equals is therefore arbitrary, and a genuinely relevant record can be pushed
+ * out of the window by near-duplicates of one neighbour. This is a scoring
+ * problem, not a retrieval one — the records are found, they just do not
+ * surface — and fixing it means changing how results are ranked and
+ * diversified.
+ *
  * Usage:
  *   node scripts/eval.mjs                     # local fixtures if present, else sample
  *   node scripts/eval.mjs --fixtures <path>
