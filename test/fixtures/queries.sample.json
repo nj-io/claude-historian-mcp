@@ -1,0 +1,27 @@
+[
+  {
+    "id": "contract/no-match-is-graceful",
+    "query": "zzzqqxnonexistenttokenzzz",
+    "expect_session": "__none__",
+    "expect_within_top": 10,
+    "expected_fail_until": "never",
+    "note": "A term that cannot appear in any corpus. Asserts the server returns an empty result set with a hint rather than erroring or hanging. The pin is deliberately unsatisfiable, so this fixture is always 'deferred' - what matters is that it completes and reports 0 returned."
+  },
+  {
+    "id": "contract/short-query-rejected",
+    "query": "ab",
+    "expect_session": "__none__",
+    "expect_within_top": 10,
+    "expected_fail_until": "never",
+    "note": "Below the 3-character floor. Must return empty, not scan the corpus."
+  },
+  {
+    "id": "contract/sessions-browse-needs-no-query",
+    "query": "",
+    "scope": "sessions",
+    "expect_session": "__any__",
+    "expect_within_top": 5,
+    "expected_fail_until": "never",
+    "note": "Browse-mode scope. Asserts the server does not require a query for scope:'sessions'."
+  }
+]
