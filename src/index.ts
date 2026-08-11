@@ -29,22 +29,6 @@ import { UniversalHistorySearchEngine } from './universal-engine.js';
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json') as { version: string };
 
-// ── Migration hints ─────────────────────────────────────────────
-
-// Migration map: old tool names → new invocation hints
-const MIGRATION_HINTS: Record<string, string> = {
-  search_conversations: 'Tool renamed → search(scope: "conversations")',
-  find_file_context: 'Tool renamed → search(scope: "files", filepath: "...")',
-  find_similar_queries: 'Tool renamed → search(scope: "similar")',
-  get_error_solutions: 'Tool renamed → search(scope: "errors")',
-  search_plans: 'Tool renamed → search(scope: "plans")',
-  search_config: 'Tool renamed → search(scope: "config")',
-  search_tasks: 'Tool renamed → search(scope: "tasks")',
-  list_recent_sessions: 'Tool renamed → search(scope: "sessions")',
-  find_tool_patterns: 'Tool renamed → search(scope: "tools")',
-  extract_compact_summary: 'Tool renamed → inspect(session_id: "...")',
-};
-
 // ── Server ──────────────────────────────────────────────────────
 
 class ClaudeHistorianServer {
@@ -62,8 +46,23 @@ class ClaudeHistorianServer {
         description: 'Conversation history search across Claude Code sessions',
       },
       {
-        instructions:
-          'Claude Historian searches your conversation history. Use search(scope) to find past conversations, decisions, errors, files, tools, plans, config, tasks, and memories. Use inspect(sessionId) to summarize a specific session with optional focus and detail level.',
+        instructions: [
+          'Claude Historian searches this machine\'s Claude Code conversation history.',
+          '',
+          'Scope before you search — it is the difference between milliseconds and seconds.',
+          'The history is gigabytes; an unscoped search reads all of it.',
+          '',
+          '  search(query, session_id: "current")  — THIS conversation\'s own history.',
+          '      Reads one file. Use it for "what did we discuss earlier", "what did I say',
+          '      about X", "did we already try this". Nearly free.',
+          '  search(query, project: "current")     — the project this server runs in.',
+          '  search(query)                         — every session, every project. Slowest;',
+          '      use when you genuinely do not know where the answer is.',
+          '',
+          'search results carry the session id and source file, so any hit can be followed up',
+          'with inspect(session_id) for a summary, or transcript(session_id) for the full text.',
+          'Both also accept "current".',
+        ].join('\n'),
       },
     );
 
@@ -74,34 +73,22 @@ class ClaudeHistorianServer {
   }
 
   private setupToolHandlers(): void {
-    // Migration layer: register deprecated tool names with helpful redirect errors
-    for (const [oldName, hint] of Object.entries(MIGRATION_HINTS)) {
-      this.server.registerTool(
-        oldName,
-        {
-          title: oldName,
-          description: hint,
-          inputSchema: {},
-        },
-        () => ({
-          content: [{ type: 'text' as const, text: hint }],
-          isError: true,
-        }),
-      );
-    }
-
     this.server.registerTool(
       'search',
       {
         title: 'Search History',
         description:
-          'Search through Claude Code conversation history, .claude files (rules, skills, agents, plans, CLAUDE.md), memories, and task management data with smart insights',
+          'Search past Claude Code conversations and .claude files (rules, skills, agents, ' +
+          'plans, CLAUDE.md), memories and tasks. Pass session_id:"current" to search this ' +
+          'conversation\'s own history — far faster than searching everything.',
         inputSchema: {
           query: z
             .string()
             .optional()
             .describe(
-              'Search query to find relevant conversations. Optional for browse-mode scopes (sessions, tools).',
+              'What to look for. Keywords beat sentences: filler words are stripped, so ' +
+                '"egress quota" and "why did we do the egress quota thing" search the same terms. ' +
+                'Optional only for browse-mode scopes (sessions, tools).',
             ),
           scope: z
             .enum([
@@ -131,12 +118,16 @@ class ClaudeHistorianServer {
             .enum(['summary', 'detailed', 'raw'])
             .optional()
             .default('summary')
-            .describe('Response detail: summary (default), detailed, raw'),
+            .describe(
+              'How much of each hit to return. "summary" (default) truncates content; ' +
+                '"detailed" returns full content plus extracted context; "raw" returns the ' +
+                'underlying records. Use "detailed" when the snippet is not enough to answer.',
+            ),
           limit: z
             .number()
             .optional()
             .default(10)
-            .describe('Maximum number of results (default: 10)'),
+            .describe('Maximum results (default 10). Cost is dominated by scope, not by limit.'),
           session_id: z
             .string()
             .optional()
@@ -155,8 +146,17 @@ class ClaudeHistorianServer {
                 'launched from, a bare name like "likewiki", or an absolute path. Cheaper than ' +
                 'searching everything when you know where the answer lives. Omit to search all projects.',
             ),
-          filepath: z.string().optional().describe('File path for scope: "files"'),
-          timeframe: z.string().optional().describe('Time range filter (today, week, month)'),
+          filepath: z
+            .string()
+            .optional()
+            .describe('Required for scope:"files" — the file whose history you want.'),
+          timeframe: z
+            .string()
+            .optional()
+            .describe(
+              'Restrict to a recent window: "today", "week" or "month". Narrows the files read, ' +
+                'so it is cheaper as well as more precise.',
+            ),
         },
         annotations: {
           readOnlyHint: true,
@@ -185,7 +185,10 @@ class ClaudeHistorianServer {
       'inspect',
       {
         title: 'Inspect Session',
-        description: 'Get intelligent summary of a conversation session with key insights',
+        description:
+          'Summarize one session: what was worked on, which files and tools, what was resolved. ' +
+          'Takes a session id from a search result, or "current". Use after search when a hit ' +
+          'looks relevant and you want the surrounding context.',
         inputSchema: {
           session_id: z
             .string()
