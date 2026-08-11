@@ -686,7 +686,16 @@ export class HistorySearchEngine {
     const tools = (message.context?.toolsUsed || []).sort().join('|');
     const files = (message.context?.filesReferenced || []).length > 0 ? 'files' : 'nofiles';
 
-    return `${message.type}:${tools}:${files}:${contentHash}`;
+    // Delegated work is never a duplicate of the parent's record of it. An
+    // agent's report is routinely echoed verbatim into the parent transcript,
+    // so without this the subagent row — the one that can be traced back to the
+    // agent's own reasoning — was dropped as a duplicate before roll-up ever
+    // saw it, quietly undoing the point of searching subagent transcripts.
+    // Roll-up collapses the sidechain side afterwards, so this does not
+    // reintroduce the flooding it exists to prevent.
+    const origin = message.isSidechain ? `side:${message.sessionId}` : 'direct';
+
+    return `${origin}:${message.type}:${tools}:${files}:${contentHash}`;
   }
 
   private async processProjectDirectory(
