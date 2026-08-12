@@ -91,13 +91,26 @@ Requires the MCP server installed first. See the emporium for other Claude Code 
 
 ## features
 
-[MCP server](https://modelcontextprotocol.io/) that gives Claude access to your conversation history. Two tools, 11 scopes, zero dependencies.
+[MCP server](https://modelcontextprotocol.io/) that gives Claude access to your conversation history. Three tools, 11 scopes, zero dependencies.
 
 Runs locally (with cool shades `[⌐■_■] 📜`):
 
 #### `search`
 
 Search across conversations, files, errors, plans, config, tasks, sessions, tools, similar queries, and memories.
+
+Scope first — the history is gigabytes, and an unscoped search reads all of it:
+
+```
+search query="egress quota" session_id="current"          # THIS conversation, ~30ms
+search query="egress quota" project="current"             # this project
+search query="egress quota" project="my-app"              # a named project
+search query="egress quota"                               # everything (slowest)
+```
+
+`scope` selects what kind of thing to search. `all` (the default) covers
+conversations plus plans, config and memories; the rest are not included and
+must be named:
 
 ```
 search query="docker auth error"                          # default scope: all
@@ -111,8 +124,11 @@ search filepath="package.json" scope="files"              # file change history
 search scope="sessions"                                   # recent sessions
 search scope="memories"                                   # project memory files
 search query="deploy" scope="all" detail_level="detailed" # full context
-search query="auth" timeframe="7d" project="my-app"       # filtered
+search query="auth" timeframe="week" project="my-app"     # filtered
 ```
+
+`timeframe` accepts `today`, `yesterday`, `week`, `last-week`, `month`,
+`last-month`. Other values are ignored silently, so `"7d"` filters nothing.
 
 ```json
 📜 ── search "docker auth" ── 5 results · 405 tokens
@@ -124,6 +140,8 @@ search query="auth" timeframe="7d" project="my-app"       # filtered
     "content": "Fixed Docker auth by updating registry credentials...",
     "project": "my-app",
     "score": 100,
+    "session": "8cfa22a2-6d62-4b1a-a826-0b4eba5a065a",
+    "source": "-Users-me-dev-my-app/8cfa22a2-....jsonl:1204",
     "ctx": { "filesReferenced": ["docker-compose.yml"], "toolsUsed": ["Edit", "Bash"] }
   }]
 }
@@ -162,7 +180,8 @@ search query="auth" timeframe="7d" project="my-app"       # filtered
 Get an intelligent summary of any session by ID (full UUID or short prefix).
 
 ```
-inspect session_id="latest"                      # most recent session
+inspect session_id="current"                     # the session calling this server
+inspect session_id="latest"                      # most recently modified session
 inspect session_id="d537af65"                    # short prefix works
 inspect session_id="d537af65" focus="files"      # only file changes
 inspect session_id="d537af65" focus="tools"      # only tool usage
@@ -186,6 +205,21 @@ inspect session_id="d537af65" focus="solutions"  # only solutions
   }
 }
 ```
+
+#### `transcript`
+
+Get a clean conversation transcript — human and assistant text only, no tool
+calls or system content. Useful for handing accurate context to a sub-agent.
+
+```
+transcript session_id="current"                  # this conversation
+transcript session_id="d537af65" latest=50       # last 50 messages
+transcript session_id="d537af65" format="json"   # structured output
+```
+
+`session_id` defaults to `"latest"`, which resolves by modification time — with
+several sessions open that can be a different conversation, so prefer
+`"current"`.
 
 ## methodology
 
