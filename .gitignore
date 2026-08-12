@@ -42,3 +42,6 @@ CLAUDE.md
 # queries.sample.json is synthetic and IS committed.
 test/fixtures/queries.local.json
 test/fixtures/baseline.local.json
+
+# Local working notes (plans, scratch) — never published
+*.local.md

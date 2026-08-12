@@ -12,6 +12,11 @@ An [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for s
 
 ---
 
+## fork
+
+This is a fork. See [FORK.md](FORK.md) for what diverges from upstream, how to
+run the evaluation harness, and which approaches were tried and rejected.
+
 ## install
 
 **Requirements:**
