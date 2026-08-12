@@ -1,5 +1,7 @@
 # Dependencies
 node_modules/
+# ...including when it is a symlink, as git worktrees often need
+node_modules
 
 # Build output
 dist/
