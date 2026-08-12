@@ -18,6 +18,9 @@ demo/.claude/
 !.claude/skills/
 .mcp.json
 
+# Git worktrees created for feature work
+.claude-worktrees/
+
 # Development
 *.log
 *.tmp
