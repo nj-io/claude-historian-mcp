@@ -47,7 +47,7 @@ class ClaudeHistorianServer {
       },
       {
         instructions: [
-          'Claude Historian searches this machine\'s Claude Code conversation history.',
+          "Claude Historian searches this machine's Claude Code conversation history.",
           '',
           'Scope before you search — it is the difference between milliseconds and seconds.',
           'The history is gigabytes; an unscoped search reads all of it.',
@@ -80,7 +80,7 @@ class ClaudeHistorianServer {
         description:
           'Search past Claude Code conversations and .claude files (rules, skills, agents, ' +
           'plans, CLAUDE.md), memories and tasks. Pass session_id:"current" to search this ' +
-          'conversation\'s own history — far faster than searching everything.',
+          "conversation's own history — far faster than searching everything.",
         inputSchema: {
           query: z
             .string()

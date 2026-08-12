@@ -648,8 +648,7 @@ export class HistorySearchEngine {
     }
 
     return [...direct, ...rolled].sort(
-      (a, b) =>
-        (b.finalScore ?? b.relevanceScore ?? 0) - (a.finalScore ?? a.relevanceScore ?? 0),
+      (a, b) => (b.finalScore ?? b.relevanceScore ?? 0) - (a.finalScore ?? a.relevanceScore ?? 0),
     );
   }
 

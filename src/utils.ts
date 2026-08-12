@@ -628,7 +628,9 @@ export async function findJsonlFiles(projectDir: string): Promise<string[]> {
     // journal.jsonl is workflow bookkeeping — no message records, so it can
     // never satisfy a content query. Excluding it by name is cheaper than
     // gating it line by line, and keeps it out of session listings.
-    const jsonlFiles = entries.filter((file) => file.endsWith('.jsonl') && file !== 'journal.jsonl');
+    const jsonlFiles = entries.filter(
+      (file) => file.endsWith('.jsonl') && file !== 'journal.jsonl',
+    );
 
     // Get mtime for each file and sort by most recent first - fixes #70
     const filesWithStats = await Promise.all(
