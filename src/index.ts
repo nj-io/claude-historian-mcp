@@ -119,15 +119,25 @@ class ClaudeHistorianServer {
             .optional()
             .default('summary')
             .describe(
-              'How much of each hit to return. "summary" (default) truncates content; ' +
-                '"detailed" returns full content plus extracted context; "raw" returns the ' +
-                'underlying records. Use "detailed" when the snippet is not enough to answer.',
+              'How much of each hit to return, and the main lever on response size. ' +
+                '"summary" (default) caps content at ~500 chars per hit — roughly 2.8k tokens ' +
+                'for 12 results. "detailed" returns up to ~4k chars per hit, which is where ' +
+                'long messages are already truncated — roughly 13k tokens for 12 results, ' +
+                'enough to crowd a context window. "raw" returns the underlying records. ' +
+                'Prefer summary to locate the right hit, then inspect(session_id) or ' +
+                'transcript(session_id) on that one result. If you want detailed, keep ' +
+                'limit at 3-5.',
             ),
           limit: z
             .number()
             .optional()
             .default(10)
-            .describe('Maximum results (default 10). Cost is dominated by scope, not by limit.'),
+            .describe(
+              'Maximum results (default 10). Scope drives how long the search takes; limit ' +
+                'drives how large the response is. With detail_level "detailed" the two ' +
+                'multiply — about 4k chars per result — so 12 detailed results is ~13k tokens. ' +
+                'With "summary" a limit of 20-30 is inexpensive.',
+            ),
           session_id: z
             .string()
             .optional()
