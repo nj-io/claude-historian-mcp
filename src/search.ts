@@ -15,11 +15,19 @@ import {
   PlanResult,
   QueryAnalysis,
   SessionInfo,
+  SessionScope,
 } from './types.js';
 import {
+  splitQueryTerms,
+  projectMatches,
+  mapWithConcurrency,
+  FILE_CONCURRENCY,
+  findJsonlFilesRecursive,
   findProjectDirectories,
   findJsonlFiles,
   getTimeRangeFilter,
+  getTimeRangeCutoff,
+  filterFilesByMtime,
   findPlanFiles,
   getClaudePlansPath,
   getClaudeProjectsPath,
@@ -123,8 +131,14 @@ export class HistorySearchEngine {
     projectFilter?: string,
     timeframe?: string,
     limit: number = 15, // Default to 15 for better coverage
+    sessionScope?: SessionScope,
   ): Promise<SearchResult> {
-    const cacheKey = `search|${query}|${projectFilter ?? ''}|${timeframe ?? ''}|${limit}`;
+    // Every scoping input belongs in the key. Omitting one serves another
+    // scope's results for the cache lifetime — a session-scoped query returned
+    // a whole-corpus result set in 11ms because session was not part of it.
+    const cacheKey =
+      `search|${query}|${projectFilter ?? ''}|${timeframe ?? ''}|${limit}` +
+      `|${sessionScope?.projectDir ?? ''}/${sessionScope?.filename ?? ''}`;
     const cached = this.getCached<SearchResult>(cacheKey);
     if (cached) return cached;
 
@@ -143,6 +157,7 @@ export class HistorySearchEngine {
         startTime,
         projectFilter,
         timeframe,
+        sessionScope,
       );
       this.setCache(cacheKey, result);
       return result;
@@ -170,7 +185,7 @@ export class HistorySearchEngine {
         lowerQuery.includes('code'),
       expectsSolution:
         lowerQuery.includes('how') || lowerQuery.includes('fix') || lowerQuery.includes('solve'),
-      keywords: lowerQuery.split(/\s+/).filter((w) => w.length > 2),
+      keywords: splitQueryTerms(query),
       semanticBoosts: this.getSemanticBoosts(lowerQuery),
     };
   }
@@ -196,8 +211,31 @@ export class HistorySearchEngine {
     startTime: number,
     projectFilter?: string,
     timeframe?: string,
+    sessionScope?: SessionScope,
   ): Promise<SearchResult> {
     const timeFilter = getTimeRangeFilter(timeframe);
+
+    // Session scope short-circuits discovery entirely: one known file instead
+    // of the whole corpus. This is the difference between milliseconds and
+    // seconds, and it is the common case for "what did we discuss earlier".
+    if (sessionScope) {
+      const messages = await this.processJsonlFile(
+        sessionScope.projectDir,
+        sessionScope.filename,
+        query,
+        timeFilter,
+      );
+      const relevant = messages.filter((m) => this.isHighlyRelevant(m, query, analysis));
+      // No roll-up here: the caller asked to look inside one conversation, so
+      // individual hits with agent attribution are what they want.
+      const top = this.selectTopRelevantResults(relevant, query, analysis).slice(0, limit);
+      return {
+        messages: top,
+        totalResults: relevant.length,
+        searchQuery: query,
+        executionTime: Date.now() - startTime,
+      };
+    }
 
     try {
       const projectDirs = await findProjectDirectories();
@@ -217,7 +255,7 @@ export class HistorySearchEngine {
 
       // Search all projects — no artificial scope limits
       const targetDirs = projectFilter
-        ? expandedDirs.filter((dir) => dir.includes(projectFilter))
+        ? expandedDirs.filter((dir) => projectMatches(dir, projectFilter))
         : expandedDirs;
 
       // Parallel processing with quality threshold
@@ -226,16 +264,14 @@ export class HistorySearchEngine {
         query,
         analysis,
         timeFilter,
+        getTimeRangeCutoff(timeframe),
       );
 
       // Project-name boosting: if any query term matches a project directory name,
       // boost all results from that project.
       // Use encoded dir names directly to avoid lossy decodeProjectPath
       // (which converts real hyphens to slashes, e.g. codex-mcp-historian → codex/mcp/historian)
-      const queryTermsLower = query
-        .toLowerCase()
-        .split(/\s+/)
-        .filter((w) => w.length > 2);
+      const queryTermsLower = splitQueryTerms(query);
       const matchingProjectDirs = new Set<string>();
       for (const dir of targetDirs) {
         const dirLower = dir.toLowerCase();
@@ -258,7 +294,10 @@ export class HistorySearchEngine {
       }
 
       // Intelligent relevance scoring and selection with quality guarantee
-      const topRelevant = this.selectTopRelevantResults(candidates, query, analysis, limit);
+      // Roll up delegated work before limiting, so a fan-out of agents costs
+      // one result slot rather than all of them.
+      const scored = this.selectTopRelevantResults(candidates, query, analysis);
+      const topRelevant = this.rollUpSidechains(scored).slice(0, limit);
 
       // Quality gate: Only return results that meet minimum value threshold
       const qualityResults = topRelevant.filter(
@@ -292,6 +331,7 @@ export class HistorySearchEngine {
     query: string,
     analysis: QueryAnalysis,
     timeFilter: ((timestamp: string) => boolean) | undefined,
+    cutoffMs?: number,
   ): Promise<CompactMessage[]> {
     // All projects in one Promise.allSettled — libuv thread pool (4 threads)
     // already throttles I/O. No batching, no caps, no early termination.
@@ -299,7 +339,7 @@ export class HistorySearchEngine {
     // parallelizes across all JSONL files within the project).
     const projectResults = await Promise.allSettled(
       projectDirs.map((projectDir) =>
-        this.processProjectFocused(projectDir, query, analysis, timeFilter),
+        this.processProjectFocused(projectDir, query, analysis, timeFilter, cutoffMs),
       ),
     );
 
@@ -321,24 +361,29 @@ export class HistorySearchEngine {
     query: string,
     _analysis: QueryAnalysis,
     timeFilter: ((timestamp: string) => boolean) | undefined,
+    cutoffMs?: number,
   ): Promise<CompactMessage[]> {
     try {
-      const jsonlFiles = await findJsonlFiles(projectDir);
+      // Conversation search is the one caller that wants subagent transcripts.
+      // Session listing and session-by-id lookup must not see them — see
+      // findJsonlFilesRecursive for why.
+      let jsonlFiles = await findJsonlFilesRecursive(projectDir);
+      if (cutoffMs !== undefined) {
+        jsonlFiles = await filterFilesByMtime(projectDir, jsonlFiles, cutoffMs);
+      }
 
-      // All files in parallel — no sequential loop, no break, no cap.
-      // libuv thread pool (4 threads) naturally throttles I/O. Parser
-      // pre-filters eliminate 80-95% of data before objects are created.
-      // Same pattern as findFileContext (line 945).
-      const fileResults = await Promise.allSettled(
-        jsonlFiles.map((file) => this.processJsonlFile(projectDir, file, query, timeFilter)),
+      // Bounded fan-out. Issuing every file at once was fine at 64 files per
+      // project; with subagent transcripts included one project holds 1,282,
+      // and flooding the thread pool made each file's pre-filter wait behind
+      // all the others instead of skipping and moving on.
+      const fileResults = await mapWithConcurrency(jsonlFiles, FILE_CONCURRENCY, (file) =>
+        this.processJsonlFile(projectDir, file, query, timeFilter),
       );
 
       const messages: CompactMessage[] = [];
       for (const result of fileResults) {
-        if (result.status === 'fulfilled') {
-          const relevant = result.value.filter((msg) => (msg.relevanceScore || 0) >= 0.5);
-          messages.push(...relevant);
-        }
+        if (!result) continue;
+        messages.push(...result.filter((msg) => (msg.relevanceScore || 0) >= 0.5));
       }
       return messages;
     } catch (error) {
@@ -428,22 +473,25 @@ export class HistorySearchEngine {
     }
   }
 
+  /**
+   * Score, rank and deduplicate candidates.
+   *
+   * @remarks
+   * Returns the full ranked set rather than truncating: roll-up runs after
+   * this, and collapsing subagent groups is only correct with every hit in
+   * hand. Callers apply their own limit.
+   */
   private selectTopRelevantResults(
     candidates: CompactMessage[],
     query: string,
     analysis: QueryAnalysis,
-    limit: number,
   ): CompactMessage[] {
     // Hoist query term computation — was recomputed per candidate inside .map()
     // Dedup to prevent double-counting (e.g. "token progress LLM progress" counted "progress" twice)
-    const queryTerms = [
-      ...new Set(
-        query
-          .toLowerCase()
-          .split(/\s+/)
-          .filter((w) => w.length > 2),
-      ),
-    ];
+    // Must agree with the pre-filter's view of the query. When they differ,
+    // stopword hits inflate matchCount — a message containing only "the" and
+    // "did" scored the same boost as one matching every real term.
+    const queryTerms = splitQueryTerms(query);
 
     const scoredCandidates = candidates.map((msg) => {
       let score = msg.relevanceScore || 0;
@@ -505,7 +553,7 @@ export class HistorySearchEngine {
 
     const deduped = this.intelligentDeduplicate(sorted);
 
-    return deduped.slice(0, limit);
+    return deduped;
   }
 
   private messageMatchesSemanticType(message: CompactMessage, type: string): boolean {
@@ -543,6 +591,68 @@ export class HistorySearchEngine {
     }
   }
 
+  /**
+   * Collapse subagent hits into one row per parent session.
+   *
+   * @remarks
+   * Subagent transcripts carry their PARENT's sessionId, so without this a
+   * fan-out floods the results: one session in this corpus spawned 1,239
+   * agents, and a broad query against it would return page after page of
+   * near-identical rows from agents working the same problem.
+   *
+   * The best-scoring hit represents the group and names the agents behind it,
+   * so the roll-up adds attribution rather than hiding it. The agent list is
+   * capped for the same reason the roll-up exists.
+   *
+   * Parent-session messages are never collapsed — only delegated work is.
+   * Session-scoped search skips this entirely: there the caller has asked to
+   * see inside one conversation, so per-message hits with agent attribution are
+   * the point.
+   */
+  private rollUpSidechains(messages: CompactMessage[]): CompactMessage[] {
+    const MAX_AGENTS_LISTED = 5;
+    const direct: CompactMessage[] = [];
+    const bySession = new Map<string, CompactMessage[]>();
+
+    for (const msg of messages) {
+      if (!msg.isSidechain) {
+        direct.push(msg);
+        continue;
+      }
+      const key = msg.sessionId || msg.sourceFile || '';
+      const group = bySession.get(key);
+      if (group) group.push(msg);
+      else bySession.set(key, [msg]);
+    }
+
+    const rolled: CompactMessage[] = [];
+    for (const group of bySession.values()) {
+      const best = group.reduce((a, b) =>
+        (b.finalScore ?? b.relevanceScore ?? 0) > (a.finalScore ?? a.relevanceScore ?? 0) ? b : a,
+      );
+
+      const hitsByAgent = new Map<string, number>();
+      for (const msg of group) {
+        const id = msg.agentId ?? 'unknown';
+        hitsByAgent.set(id, (hitsByAgent.get(id) ?? 0) + 1);
+      }
+
+      rolled.push({
+        ...best,
+        rolledUpHits: group.length,
+        contributingAgents: [...hitsByAgent.entries()]
+          .map(([agentId, hits]) => ({ agentId, hits }))
+          .sort((a, b) => b.hits - a.hits)
+          .slice(0, MAX_AGENTS_LISTED),
+      });
+    }
+
+    return [...direct, ...rolled].sort(
+      (a, b) =>
+        (b.finalScore ?? b.relevanceScore ?? 0) - (a.finalScore ?? a.relevanceScore ?? 0),
+    );
+  }
+
   private intelligentDeduplicate(messages: CompactMessage[]): CompactMessage[] {
     const seen = new Map<string, CompactMessage>();
 
@@ -576,7 +686,16 @@ export class HistorySearchEngine {
     const tools = (message.context?.toolsUsed || []).sort().join('|');
     const files = (message.context?.filesReferenced || []).length > 0 ? 'files' : 'nofiles';
 
-    return `${message.type}:${tools}:${files}:${contentHash}`;
+    // Delegated work is never a duplicate of the parent's record of it. An
+    // agent's report is routinely echoed verbatim into the parent transcript,
+    // so without this the subagent row — the one that can be traced back to the
+    // agent's own reasoning — was dropped as a duplicate before roll-up ever
+    // saw it, quietly undoing the point of searching subagent transcripts.
+    // Roll-up collapses the sidechain side afterwards, so this does not
+    // reintroduce the flooding it exists to prevent.
+    const origin = message.isSidechain ? `side:${message.sessionId}` : 'direct';
+
+    return `${origin}:${message.type}:${tools}:${files}:${contentHash}`;
   }
 
   private async processProjectDirectory(
@@ -2070,7 +2189,7 @@ export class HistorySearchEngine {
     content: string,
   ): number {
     const lowerQuery = query.toLowerCase();
-    const queryTerms = lowerQuery.split(/\s+/).filter((w) => w.length > 2);
+    const queryTerms = splitQueryTerms(query);
 
     let score = 0;
 
@@ -2119,7 +2238,7 @@ export class HistorySearchEngine {
       const results: CompactMessage[] = [];
       const configFiles = await findClaudeMarkdownFiles();
       const lowerQuery = query.toLowerCase();
-      const queryTerms = lowerQuery.split(/\s+/).filter((w) => w.length > 2);
+      const queryTerms = splitQueryTerms(query);
 
       for (const { path, category } of configFiles) {
         try {
@@ -2203,7 +2322,7 @@ export class HistorySearchEngine {
       const results: CompactMessage[] = [];
       const projectsPath = getClaudeProjectsPath();
       const lowerQuery = query.toLowerCase();
-      const queryTerms = lowerQuery.split(/\s+/).filter((w) => w.length > 2);
+      const queryTerms = splitQueryTerms(query);
 
       // Glob: ~/.claude/projects/*/memory/*.md
       let projectDirs: string[];
@@ -2299,7 +2418,7 @@ export class HistorySearchEngine {
       const results: CompactMessage[] = [];
       const taskFiles = await findTaskFiles();
       const lowerQuery = query.toLowerCase();
-      const queryTerms = lowerQuery.split(/\s+/).filter((w) => w.length > 2);
+      const queryTerms = splitQueryTerms(query);
 
       for (const filePath of taskFiles) {
         try {

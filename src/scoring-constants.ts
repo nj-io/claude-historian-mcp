@@ -25,9 +25,6 @@ export const MAJORITY_MATCH_BONUS = 4;
 
 // ── Context scoring weights ────────────────────────────────────────
 
-/** Bonus for messages that use tools (tool_use / tool_result). */
-export const TOOL_USAGE_SCORE = 5;
-
 /** Bonus for messages containing file path references. */
 export const FILE_REFERENCE_SCORE = 3;
 

@@ -30,3 +30,10 @@ isolate-*.log
 
 # Generated docs
 CLAUDE.md
+
+# Eval fixtures derived from real conversation history.
+# These contain real session ids and query strings lifted from private work;
+# this is a public fork, so they must never be committed.
+# queries.sample.json is synthetic and IS committed.
+test/fixtures/queries.local.json
+test/fixtures/baseline.local.json

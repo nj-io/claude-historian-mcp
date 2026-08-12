@@ -21,6 +21,9 @@ import { ClaudeMessage, MessageContentBlock } from './types.js';
 const DIR_CACHE_TTL = 30_000;
 const projectDirCache: { dirs: string[]; ts: number } = { dirs: [], ts: 0 };
 const jsonlFileCache = new Map<string, { files: string[]; ts: number }>();
+/** Separate cache: recursive listings include subagent transcripts, so the two
+ * must never be served interchangeably. */
+const recursiveFileCache = new Map<string, { files: string[]; ts: number }>();
 
 // ── Path resolution ────────────────────────────────────────────────
 
@@ -187,6 +190,356 @@ export async function findTaskFiles(): Promise<string[]> {
   }
 }
 
+/**
+ * Map over items with a bounded number of concurrent operations.
+ *
+ * @remarks
+ * `Promise.allSettled` over every file in a project was tolerable at 64 files.
+ * Once subagent transcripts are included one project holds 1,282, and the
+ * corpus 2,745 — issuing them all at once floods the libuv thread pool, so
+ * every read queues behind every other and the file-level pre-filter loses its
+ * ability to finish early and move on. Bounding the fan-out keeps the pool
+ * saturated without the queueing.
+ *
+ * Rejections resolve to `undefined` rather than failing the batch, matching
+ * `allSettled` semantics at the call sites this replaces.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<(R | undefined)[]> {
+  const results: (R | undefined)[] = Array.from({ length: items.length });
+  let next = 0;
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      try {
+        results[index] = await fn(items[index]);
+      } catch {
+        results[index] = undefined;
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/** Concurrent file reads per project. Tuned against the libuv thread pool. */
+export const FILE_CONCURRENCY = 24;
+
+// ── Session and project identity ────────────────────────────────────
+
+/**
+ * The session this server process was launched from, if known.
+ *
+ * @remarks
+ * Claude Code exports `CLAUDE_CODE_SESSION_ID` into each MCP server it spawns,
+ * one server per session, so this identifies the caller exactly. Note the name:
+ * `CLAUDE_SESSION_ID` does not exist.
+ *
+ * It is captured at spawn and never refreshed. After `/clear` or a resume the
+ * CLI rotates to a new session file while this value keeps pointing at the old
+ * one — undetectable from here when that old file still exists. Roughly 40% of
+ * long-lived server processes hold an id whose file is already gone.
+ */
+export function getCurrentSessionId(): string | undefined {
+  return process.env.CLAUDE_CODE_SESSION_ID || undefined;
+}
+
+/** The project directory this server process was launched from, if known. */
+export function getCurrentProjectDir(): string | undefined {
+  return process.env.CLAUDE_PROJECT_DIR || undefined;
+}
+
+/** Outcome of resolving a `session_id` argument to a concrete session. */
+export interface SessionResolution {
+  sessionId?: string;
+  /** Encoded project directory holding the session file. */
+  projectDir?: string;
+  filename?: string;
+  /** Present when resolution failed; safe to surface to the caller. */
+  error?: string;
+}
+
+/**
+ * Resolve a session argument — a full id, a short prefix, or `"current"` — to
+ * the session file that backs it.
+ *
+ * @remarks
+ * Resolution searches every project directory, because worktrees place session
+ * files under encoded directories the caller cannot predict.
+ *
+ * Failure is explicit and never guesses. Falling back to the most recently
+ * modified file was considered and rejected: with many sessions open at once
+ * the newest file in a project routinely belongs to a *different* live session,
+ * so the guess would hand one conversation's transcript to another — wrong
+ * results, and a disclosure of content the caller never asked for.
+ */
+export async function resolveSession(argument: string): Promise<SessionResolution> {
+  const wantsCurrent = argument.toLowerCase() === 'current';
+  const target = wantsCurrent ? getCurrentSessionId() : argument;
+
+  if (wantsCurrent && !target) {
+    return {
+      error:
+        'No current session: CLAUDE_CODE_SESSION_ID is not set for this server. ' +
+        'Pass an explicit session_id, or use scope:"sessions" to list recent sessions.',
+    };
+  }
+  if (!target) return { error: 'session_id was empty.' };
+
+  const needle = target.toLowerCase();
+  const projectDirs = await findProjectDirectories();
+  const matches: { projectDir: string; filename: string; sessionId: string }[] = [];
+
+  for (const projectDir of projectDirs) {
+    for (const filename of await findJsonlFiles(projectDir)) {
+      const id = filename.replace(/\.jsonl$/, '');
+      if (id.toLowerCase().startsWith(needle)) {
+        matches.push({ projectDir, filename, sessionId: id });
+      }
+    }
+  }
+
+  if (matches.length === 0) {
+    return {
+      error: wantsCurrent
+        ? `No transcript found for the current session (${target}). ` +
+          'The session may have been cleared or resumed since this server started. ' +
+          'Pass an explicit session_id, or use scope:"sessions" to list recent sessions.'
+        : `No session matches "${argument}". Use scope:"sessions" to list recent sessions.`,
+    };
+  }
+
+  // An exact id beats prefix candidates; otherwise ambiguity is reported rather
+  // than silently resolved to one of several possible conversations.
+  const exact = matches.find((m) => m.sessionId.toLowerCase() === needle);
+  if (!exact && matches.length > 1) {
+    const candidates = matches
+      .slice(0, 5)
+      .map((m) => m.sessionId)
+      .join(', ');
+    return {
+      error:
+        `"${argument}" matches ${matches.length} sessions. Use a longer prefix. ` +
+        `Candidates: ${candidates}${matches.length > 5 ? ', ...' : ''}`,
+    };
+  }
+
+  const hit = exact ?? matches[0];
+  return { sessionId: hit.sessionId, projectDir: hit.projectDir, filename: hit.filename };
+}
+
+/**
+ * Match a project filter against an encoded project directory name.
+ *
+ * @remarks
+ * Accepts an absolute path (encoded and compared exactly — this is how
+ * `project: "current"` resolves), or a bare name matched as a path-segment
+ * suffix. The suffix arm is required, not a nicety: `"claude-historian-mcp"`
+ * is never equal to `-Users-neil-dev-claude-historian-mcp`, so exact-only
+ * matching would return nothing for every name-based filter.
+ *
+ * Bare substring matching was what it replaced, and it silently matched
+ * everything: `"-Users-neil"` is a substring of every sibling project.
+ */
+export function projectMatches(encodedDir: string, filter: string): boolean {
+  if (!filter) return true;
+  const dir = encodedDir.toLowerCase();
+
+  if (filter.startsWith('/')) {
+    return dir === encodeProjectPath(filter).toLowerCase();
+  }
+
+  const name = filter.replace(/\//g, '-').toLowerCase().replace(/^-+/, '');
+  return dir === `-${name}` || dir.endsWith(`-${name}`);
+}
+
+// ── Query term extraction ──────────────────────────────────────────
+
+/**
+ * Words stripped from queries before filtering and scoring.
+ *
+ * @remarks
+ * `GENERIC_TERMS` already carries 175 low-signal words (the, and, for, with).
+ * Interrogatives were missing, and they dominate naturally-phrased questions:
+ * "why did we do the egress quota thing" carried four noise terms against two
+ * real ones. `the` alone is a substring hit on 42% of corpus lines, which
+ * defeated the pre-filter entirely.
+ */
+const QUERY_STOPWORDS = new Set<string>([
+  ...GENERIC_TERMS,
+  'why',
+  'did',
+  'how',
+  'was',
+  'were',
+  'what',
+  'when',
+  'where',
+  'which',
+  'who',
+  'this',
+  'that',
+  'these',
+  'those',
+  'thing',
+  'things',
+  'stuff',
+  'about',
+  'into',
+  'from',
+  'been',
+  'have',
+  'has',
+  'had',
+  'does',
+  'doing',
+  'done',
+]);
+
+/**
+ * Split a search query into the terms used for pre-filtering and scoring.
+ *
+ * @remarks
+ * The single source of truth for query term extraction. Pre-filtering and
+ * scoring MUST agree on what the query was — when they disagree, messages pass
+ * the filter and then score zero, or stopword hits inflate match counts.
+ *
+ * Callers should strip once at their entry point and thread the result through
+ * `preComputedQueryWords` rather than re-splitting downstream.
+ *
+ * Not for splitting message *content* — that uses different delimiters and
+ * length rules — nor for the case-preserving split in the case-aware filter,
+ * nor for `search-helpers`' similarity and keyword functions, which carry their
+ * own deliberately different vocabularies.
+ *
+ * @param query - Raw user query.
+ * @returns Deduplicated lowercase terms, stopwords removed.
+ */
+export function splitQueryTerms(query: string): string[] {
+  if (!query) return [];
+  const raw = query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+  const stripped = [...new Set(raw.filter((w) => !QUERY_STOPWORDS.has(w)))];
+
+  // An all-stopword query ("what did we do") strips to nothing. An empty term
+  // list disables the pre-filter, so every line in the corpus would be parsed
+  // and then score zero — slower than before the strip, for no results. Fall
+  // back to the unstripped terms: worse ranking, but bounded work.
+  return stripped.length > 0 ? stripped : [...new Set(raw)];
+}
+
+// ── Case-insensitive scanning without allocation ────────────────────
+
+/** True when every term is pure lowercase ASCII, so byte folding is valid. */
+function isAsciiLower(terms: string[]): boolean {
+  return terms.every((t) => /^[ -~]*$/.test(t));
+}
+
+/**
+ * Case-insensitive substring test over a raw buffer, without decoding it.
+ *
+ * @remarks
+ * The previous approach allocated `content.toLowerCase()` — a second full copy
+ * of every file — before testing. Over the corpus that dominated search cost:
+ * measured 9,940ms versus 2,696ms for this scan across 2.32 GB, identical
+ * results. Folds ASCII `A-Z` only; callers must check {@link isAsciiLower}
+ * first and fall back for non-ASCII terms.
+ */
+function bufferIncludesAscii(buf: Buffer, pat: Buffer): boolean {
+  const first = pat[0];
+  const FIRST = first >= 97 && first <= 122 ? first - 32 : first;
+  const n = buf.length;
+  const m = pat.length;
+  if (m === 0 || n < m) return false;
+
+  for (let i = 0, last = n - m; i <= last; i++) {
+    const c = buf[i];
+    if (c !== first && c !== FIRST) continue;
+    let j = 1;
+    for (; j < m; j++) {
+      let d = buf[i + j];
+      if (d >= 65 && d <= 90) d += 32;
+      if (d !== pat[j]) break;
+    }
+    if (j === m) return true;
+  }
+  return false;
+}
+
+/** Pre-encode terms once per file rather than per line. */
+export function encodeTerms(terms: string[]): Buffer[] | null {
+  if (!isAsciiLower(terms)) return null;
+  return terms.map((t) => Buffer.from(t, 'ascii'));
+}
+
+/** True when the buffer contains any term, case-insensitively. */
+export function bufferContainsAnyTerm(buf: Buffer, pats: Buffer[]): boolean {
+  return pats.some((p) => bufferIncludesAscii(buf, p));
+}
+
+/**
+ * Index of the next case-insensitive occurrence of an ASCII pattern.
+ *
+ * @param from - Byte offset to start searching from.
+ * @returns Byte offset of the match, or -1.
+ */
+export function indexOfAscii(buf: Buffer, pat: Buffer, from = 0): number {
+  const first = pat[0];
+  const FIRST = first >= 97 && first <= 122 ? first - 32 : first;
+  const n = buf.length;
+  const m = pat.length;
+  if (m === 0 || n < m) return -1;
+
+  for (let i = Math.max(0, from), last = n - m; i <= last; i++) {
+    const c = buf[i];
+    if (c !== first && c !== FIRST) continue;
+    let j = 1;
+    for (; j < m; j++) {
+      let d = buf[i + j];
+      if (d >= 65 && d <= 90) d += 32;
+      if (d !== pat[j]) break;
+    }
+    if (j === m) return i;
+  }
+  return -1;
+}
+
+/**
+ * Case-insensitive substring test over a string region, without allocating.
+ *
+ * @param s - Haystack.
+ * @param term - Lowercase ASCII needle.
+ * @param from - Index to start scanning from.
+ */
+export function stringIncludesCI(s: string, term: string, from = 0): boolean {
+  const m = term.length;
+  const n = s.length;
+  if (m === 0 || n - from < m) return false;
+  const first = term.charCodeAt(0);
+  const FIRST = first >= 97 && first <= 122 ? first - 32 : first;
+
+  for (let i = from, last = n - m; i <= last; i++) {
+    const c = s.charCodeAt(i);
+    if (c !== first && c !== FIRST) continue;
+    let j = 1;
+    for (; j < m; j++) {
+      let d = s.charCodeAt(i + j);
+      if (d >= 65 && d <= 90) d += 32;
+      if (d !== term.charCodeAt(j)) break;
+    }
+    if (j === m) return true;
+  }
+  return false;
+}
+
 // ── Path encoding ──────────────────────────────────────────────────
 
 /**
@@ -272,7 +625,10 @@ export async function findJsonlFiles(projectDir: string): Promise<string[]> {
     const projectsPath = getClaudeProjectsPath();
     const fullPath = join(projectsPath, projectDir);
     const entries = await readdir(fullPath);
-    const jsonlFiles = entries.filter((file) => file.endsWith('.jsonl'));
+    // journal.jsonl is workflow bookkeeping — no message records, so it can
+    // never satisfy a content query. Excluding it by name is cheaper than
+    // gating it line by line, and keeps it out of session listings.
+    const jsonlFiles = entries.filter((file) => file.endsWith('.jsonl') && file !== 'journal.jsonl');
 
     // Get mtime for each file and sort by most recent first - fixes #70
     const filesWithStats = await Promise.all(
@@ -294,6 +650,69 @@ export async function findJsonlFiles(projectDir: string): Promise<string[]> {
     console.error(`Error finding JSONL files in ${projectDir}:`, error);
     return [];
   }
+}
+
+/**
+ * List session files in a project INCLUDING subagent transcripts.
+ *
+ * @remarks
+ * Subagent transcripts live under `<sessionId>/subagents/`, both directly and
+ * beneath a `workflows/wf_...` subdirectory. They are the bulk of the corpus —
+ * roughly 2,700 files and more than half its bytes — and were entirely
+ * unreachable, so any work done by a delegated agent could not be found.
+ *
+ * Deliberately separate from {@link findJsonlFiles} rather than replacing it.
+ * The subagent directory is named after its parent session, so a recursive
+ * listing contains relative paths that begin with the session id. Callers that
+ * identify a session by prefix (`files.find(f => f.startsWith(sessionId))`) or
+ * that treat one file as one session would silently resolve to an agent
+ * transcript instead. Only search opts in.
+ *
+ * @returns Paths relative to the project directory, most recently modified first.
+ */
+export async function findJsonlFilesRecursive(projectDir: string): Promise<string[]> {
+  const now = Date.now();
+  const cached = recursiveFileCache.get(projectDir);
+  if (cached && now - cached.ts < DIR_CACHE_TTL) return cached.files;
+
+  const projectsPath = getClaudeProjectsPath();
+  const root = join(projectsPath, projectDir);
+  const found: { file: string; mtime: number }[] = [];
+
+  const walk = async (dir: string, relative: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    await Promise.all(
+      entries.map(async (entry) => {
+        const abs = join(dir, entry.name);
+        const rel = relative ? `${relative}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          await walk(abs, rel);
+        } else if (entry.name.endsWith('.jsonl') && entry.name !== 'journal.jsonl') {
+          try {
+            found.push({ file: rel, mtime: (await stat(abs)).mtimeMs });
+          } catch {
+            found.push({ file: rel, mtime: 0 });
+          }
+        }
+      }),
+    );
+  };
+
+  try {
+    await walk(root, '');
+  } catch (error) {
+    console.error(`Error walking ${projectDir}:`, error);
+    return [];
+  }
+
+  const files = found.sort((a, b) => b.mtime - a.mtime).map((f) => f.file);
+  recursiveFileCache.set(projectDir, { files, ts: now });
+  return files;
 }
 
 // ── Message extraction ─────────────────────────────────────────────
@@ -364,7 +783,6 @@ import {
   WORD_MATCH_SCORE,
   EXACT_PHRASE_BONUS,
   MAJORITY_MATCH_BONUS,
-  TOOL_USAGE_SCORE,
   FILE_REFERENCE_SCORE,
   PROJECT_MATCH_SCORE,
   CORE_TECH_PATTERN,
@@ -405,8 +823,7 @@ export function calculateRelevanceScore(
   if (!content) return 0;
 
   const lowerContent = content.toLowerCase();
-  const lowerQuery = query.toLowerCase();
-  const queryWords = preComputedQueryWords ?? lowerQuery.split(/\s+/).filter((w) => w.length > 2);
+  const queryWords = preComputedQueryWords ?? splitQueryTerms(query);
 
   // Split content into words ONCE — matchesTechTerm was re-splitting per call
   const contentWords = content.split(/[\s.,;:!?()[\]{}'"<>]+/);
@@ -423,13 +840,16 @@ export function calculateRelevanceScore(
   score += scoreSupportingTerms(queryWords, contentWordSet);
 
   // Gate metadata bonuses behind query term match.
-  // Without this, scoreToolUsage(+5) and scoreFileReferences(+3) give positive
-  // scores to messages with ZERO query relevance — "xyznonexistent" returns results.
+  // Without this, scoreFileReferences(+3) gives positive scores to messages with
+  // ZERO query relevance — "xyznonexistent" would return results.
+  //
+  // A scoreToolUsage(+5) term sat here too, keyed on type === 'tool_use' ||
+  // 'tool_result'. Those values never occur on disk — tool calls are content
+  // blocks, not record types — so it contributed nothing and is removed.
   const anyTermMatched =
     queryWords.length === 0 || queryWords.some((w) => lowerContent.includes(w));
 
   if (anyTermMatched) {
-    score += scoreToolUsage(message);
     score += scoreFileReferences(lowerContent);
     score += scoreProjectMatch(message, projectPath);
 
@@ -522,10 +942,6 @@ function scoreSupportingTerms(queryWords: string[], contentWordSet: Set<string>)
   return score;
 }
 
-function scoreToolUsage(message: ClaudeMessage): number {
-  return message.type === 'tool_use' || message.type === 'tool_result' ? TOOL_USAGE_SCORE : 0;
-}
-
 function scoreFileReferences(lowerContent: string): number {
   return lowerContent.includes('src/') ||
     lowerContent.includes('.ts') ||
@@ -563,6 +979,64 @@ export function formatTimestamp(timestamp: string): string {
  * @param timeframe - "today", "yesterday", "week", "month", or undefined (no filter).
  * @returns Predicate that returns `true` for timestamps within the range.
  */
+export function getTimeRangeCutoff(timeframe?: string): number | undefined {
+  if (!timeframe) return undefined;
+
+  const now = new Date();
+  const cutoff = new Date();
+
+  switch (timeframe.toLowerCase()) {
+    case 'today':
+      cutoff.setHours(0, 0, 0, 0);
+      break;
+    case 'yesterday':
+      cutoff.setDate(now.getDate() - 1);
+      cutoff.setHours(0, 0, 0, 0);
+      break;
+    case 'week':
+    case 'last-week':
+      cutoff.setDate(now.getDate() - 7);
+      break;
+    case 'month':
+    case 'last-month':
+      cutoff.setMonth(now.getMonth() - 1);
+      break;
+    default:
+      return undefined;
+  }
+  return cutoff.getTime();
+}
+
+/**
+ * Drop files that cannot contain messages inside a timeframe.
+ *
+ * @remarks
+ * The time filter was applied per message, after parsing, so a
+ * `timeframe:"week"` query still read every byte of every file and measured no
+ * faster than an unfiltered one. A file's mtime bounds the timestamps inside
+ * it, so files last written before the cutoff can be skipped outright.
+ *
+ * A day of slack absorbs clock skew and sessions resumed across a boundary;
+ * being generous here costs a little work, being tight would lose messages.
+ */
+export async function filterFilesByMtime(
+  projectDir: string,
+  files: string[],
+  cutoffMs: number,
+): Promise<string[]> {
+  const SKEW_MS = 24 * 60 * 60 * 1000;
+  const base = join(getClaudeProjectsPath(), projectDir);
+  const kept = await mapWithConcurrency(files, FILE_CONCURRENCY, async (file) => {
+    try {
+      const { mtimeMs } = await stat(join(base, file));
+      return mtimeMs >= cutoffMs - SKEW_MS ? file : undefined;
+    } catch {
+      return file;
+    }
+  });
+  return kept.filter((f): f is string => typeof f === 'string');
+}
+
 export function getTimeRangeFilter(timeframe?: string): (timestamp: string) => boolean {
   if (!timeframe) return () => true;
 

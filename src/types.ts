@@ -27,7 +27,22 @@ export interface ClaudeMessage {
   cwd: string;
   sessionId: string;
   version: string;
-  type: 'user' | 'assistant' | 'tool_use' | 'tool_result';
+  /**
+   * Record kind as written to disk.
+   *
+   * @remarks
+   * Observed values include `user`, `assistant`, `system`, `attachment`,
+   * `file-history-snapshot`, `queue-operation`, `permission-mode`, `ai-title`
+   * and others — the set is open, so this is deliberately `string`.
+   *
+   * Verified against the corpus: `tool_use` and `tool_result` never appear
+   * here. Tool calls live inside `message.content` blocks, not as record
+   * types. Kinds other than user/assistant carry no `message` at all and
+   * cannot satisfy a content query.
+   */
+  type: string;
+  /** Id of the subagent that produced this record, on subagent transcripts. */
+  agentId?: string;
   message?: {
     role: string;
     content: string | MessageContentBlock[];
@@ -72,10 +87,36 @@ export interface CompactSummaryData {
 export interface CompactMessage {
   uuid: string;
   timestamp: string;
-  type: 'user' | 'assistant' | 'tool_use' | 'tool_result';
+  /**
+   * Record kind. Mirrors {@link ClaudeMessage.type}; `tool_use` and
+   * `tool_result` never occur — tool calls are content blocks, not records.
+   */
+  type: string;
   content: string;
   sessionId: string;
   projectPath?: string;
+  /**
+   * Path of the JSONL file this message came from, relative to the projects
+   * directory.
+   *
+   * @remarks
+   * Not derivable from `sessionId` alone: a subagent transcript lives at
+   * `<sessionId>/subagents/agent-*.jsonl` while carrying its PARENT's
+   * `sessionId`, so reconstructing a path from the id would point at the wrong
+   * file. Carrying it explicitly is also what lets a rolled-up result be
+   * followed back to the agent transcript that actually matched.
+   */
+  sourceFile?: string;
+  /** 1-based line number of this record within {@link sourceFile}. */
+  sourceLine?: number;
+  /** Id of the subagent that produced this message, when it came from one. */
+  agentId?: string;
+  /** True when this message came from a subagent transcript. */
+  isSidechain?: boolean;
+  /** Agents that contributed hits, when this row represents rolled-up subagent work. */
+  contributingAgents?: { agentId: string; hits: number }[];
+  /** Number of subagent hits collapsed into this row. */
+  rolledUpHits?: number;
   relevanceScore?: number;
   /** Combined score after all boost passes. */
   finalScore?: number;
@@ -259,4 +300,17 @@ export interface WorkflowStep {
   toolName: string;
   context: string;
   messages: CompactMessage[];
+}
+
+/**
+ * A resolved session file, used to restrict a search to one conversation.
+ *
+ * @remarks
+ * Carries the concrete file rather than an id so the search path can skip
+ * corpus discovery entirely.
+ */
+export interface SessionScope {
+  sessionId: string;
+  projectDir: string;
+  filename: string;
 }

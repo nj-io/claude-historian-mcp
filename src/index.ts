@@ -18,6 +18,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
+import { resolveSession, getCurrentProjectDir } from './utils.js';
+import { SessionScope } from './types.js';
+
 import { BeautifulFormatter } from './formatter.js';
 import { HistorySearchEngine } from './search.js';
 import { CompactMessage } from './types.js';
@@ -25,22 +28,6 @@ import { UniversalHistorySearchEngine } from './universal-engine.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json') as { version: string };
-
-// ── Migration hints ─────────────────────────────────────────────
-
-// Migration map: old tool names → new invocation hints
-const MIGRATION_HINTS: Record<string, string> = {
-  search_conversations: 'Tool renamed → search(scope: "conversations")',
-  find_file_context: 'Tool renamed → search(scope: "files", filepath: "...")',
-  find_similar_queries: 'Tool renamed → search(scope: "similar")',
-  get_error_solutions: 'Tool renamed → search(scope: "errors")',
-  search_plans: 'Tool renamed → search(scope: "plans")',
-  search_config: 'Tool renamed → search(scope: "config")',
-  search_tasks: 'Tool renamed → search(scope: "tasks")',
-  list_recent_sessions: 'Tool renamed → search(scope: "sessions")',
-  find_tool_patterns: 'Tool renamed → search(scope: "tools")',
-  extract_compact_summary: 'Tool renamed → inspect(session_id: "...")',
-};
 
 // ── Server ──────────────────────────────────────────────────────
 
@@ -59,8 +46,23 @@ class ClaudeHistorianServer {
         description: 'Conversation history search across Claude Code sessions',
       },
       {
-        instructions:
-          'Claude Historian searches your conversation history. Use search(scope) to find past conversations, decisions, errors, files, tools, plans, config, tasks, and memories. Use inspect(sessionId) to summarize a specific session with optional focus and detail level.',
+        instructions: [
+          'Claude Historian searches this machine\'s Claude Code conversation history.',
+          '',
+          'Scope before you search — it is the difference between milliseconds and seconds.',
+          'The history is gigabytes; an unscoped search reads all of it.',
+          '',
+          '  search(query, session_id: "current")  — THIS conversation\'s own history.',
+          '      Reads one file. Use it for "what did we discuss earlier", "what did I say',
+          '      about X", "did we already try this". Nearly free.',
+          '  search(query, project: "current")     — the project this server runs in.',
+          '  search(query)                         — every session, every project. Slowest;',
+          '      use when you genuinely do not know where the answer is.',
+          '',
+          'search results carry the session id and source file, so any hit can be followed up',
+          'with inspect(session_id) for a summary, or transcript(session_id) for the full text.',
+          'Both also accept "current".',
+        ].join('\n'),
       },
     );
 
@@ -71,34 +73,22 @@ class ClaudeHistorianServer {
   }
 
   private setupToolHandlers(): void {
-    // Migration layer: register deprecated tool names with helpful redirect errors
-    for (const [oldName, hint] of Object.entries(MIGRATION_HINTS)) {
-      this.server.registerTool(
-        oldName,
-        {
-          title: oldName,
-          description: hint,
-          inputSchema: {},
-        },
-        () => ({
-          content: [{ type: 'text' as const, text: hint }],
-          isError: true,
-        }),
-      );
-    }
-
     this.server.registerTool(
       'search',
       {
         title: 'Search History',
         description:
-          'Search through Claude Code conversation history, .claude files (rules, skills, agents, plans, CLAUDE.md), memories, and task management data with smart insights',
+          'Search past Claude Code conversations and .claude files (rules, skills, agents, ' +
+          'plans, CLAUDE.md), memories and tasks. Pass session_id:"current" to search this ' +
+          'conversation\'s own history — far faster than searching everything.',
         inputSchema: {
           query: z
             .string()
             .optional()
             .describe(
-              'Search query to find relevant conversations. Optional for browse-mode scopes (sessions, tools).',
+              'What to look for. Keywords beat sentences: filler words are stripped, so ' +
+                '"egress quota" and "why did we do the egress quota thing" search the same terms. ' +
+                'Optional only for browse-mode scopes (sessions, tools).',
             ),
           scope: z
             .enum([
@@ -117,21 +107,56 @@ class ClaudeHistorianServer {
             .optional()
             .default('all')
             .describe(
-              'Search scope: all (default), conversations, files, errors, plans, config, tasks, similar, sessions, tools, memories',
+              'What to search. "all" (default) covers conversations plus plans, config and memories. ' +
+                'The remaining scopes are NOT included in "all" and must be asked for by name: ' +
+                '"errors" (past failures and their fixes), "sessions" (browse recent sessions), ' +
+                '"tools" (tool usage patterns), "files" (history for one filepath), ' +
+                '"similar" (past queries like this one), "tasks". ' +
+                'Each scans the corpus independently, so name one rather than defaulting to "all" when you know what you want.',
             ),
           detail_level: z
             .enum(['summary', 'detailed', 'raw'])
             .optional()
             .default('summary')
-            .describe('Response detail: summary (default), detailed, raw'),
+            .describe(
+              'How much of each hit to return. "summary" (default) truncates content; ' +
+                '"detailed" returns full content plus extracted context; "raw" returns the ' +
+                'underlying records. Use "detailed" when the snippet is not enough to answer.',
+            ),
           limit: z
             .number()
             .optional()
             .default(10)
-            .describe('Maximum number of results (default: 10)'),
-          project: z.string().optional().describe('Optional project name to filter results'),
-          filepath: z.string().optional().describe('File path for scope: "files"'),
-          timeframe: z.string().optional().describe('Time range filter (today, week, month)'),
+            .describe('Maximum results (default 10). Cost is dominated by scope, not by limit.'),
+          session_id: z
+            .string()
+            .optional()
+            .describe(
+              'Restrict the search to a single session. Use "current" to search THIS conversation\'s ' +
+                'own history — that reads one file instead of the whole corpus, so it returns in ' +
+                'milliseconds rather than seconds, and it is the right choice for "what did we discuss ' +
+                'earlier" or "what did I say about X before". Also accepts a full session id or a short ' +
+                'prefix. Omit to search every session.',
+            ),
+          project: z
+            .string()
+            .optional()
+            .describe(
+              'Restrict the search to one project. Use "current" for the project this server was ' +
+                'launched from, a bare name like "likewiki", or an absolute path. Cheaper than ' +
+                'searching everything when you know where the answer lives. Omit to search all projects.',
+            ),
+          filepath: z
+            .string()
+            .optional()
+            .describe('Required for scope:"files" — the file whose history you want.'),
+          timeframe: z
+            .string()
+            .optional()
+            .describe(
+              'Restrict to a recent window: "today", "week" or "month". Narrows the files read, ' +
+                'so it is cheaper as well as more precise.',
+            ),
         },
         annotations: {
           readOnlyHint: true,
@@ -160,9 +185,16 @@ class ClaudeHistorianServer {
       'inspect',
       {
         title: 'Inspect Session',
-        description: 'Get intelligent summary of a conversation session with key insights',
+        description:
+          'Summarize one session: what was worked on, which files and tools, what was resolved. ' +
+          'Takes a session id from a search result, or "current". Use after search when a hit ' +
+          'looks relevant and you want the surrounding context.',
         inputSchema: {
-          session_id: z.string().describe('Session ID to summarize'),
+          session_id: z
+            .string()
+            .describe(
+              'Session ID, short prefix, or "current" for the session calling this server.',
+            ),
           detail_level: z
             .enum(['summary', 'detailed', 'raw'])
             .optional()
@@ -214,7 +246,9 @@ class ClaudeHistorianServer {
             .optional()
             .default('latest')
             .describe(
-              'Session ID, short prefix, or "latest" (default). Tip: pass process.env.CLAUDE_SESSION_ID when available.',
+              'Session ID, short prefix, "current" for the session calling this server, or "latest" ' +
+                'for the most recently modified session. Prefer "current": "latest" resolves by ' +
+                'modification time, which with several sessions open can be a different conversation.',
             ),
           format: z
             .enum(['text', 'json'])
@@ -265,9 +299,34 @@ class ClaudeHistorianServer {
     const query = args.query as string | undefined;
     const limit = (args.limit as number) || 10;
     const detailLevel = (args.detail_level as string) || 'summary';
-    const project = args.project as string | undefined;
     const filepath = args.filepath as string | undefined;
     const timeframe = args.timeframe as string | undefined;
+
+    // "current" resolves from the environment this server was launched with.
+    // Unresolvable is an explicit error, never a guess — see resolveSession.
+    let project = args.project as string | undefined;
+    if (project?.toLowerCase() === 'current') {
+      const dir = getCurrentProjectDir();
+      if (!dir) {
+        throw new Error(
+          'project:"current" is unavailable: CLAUDE_PROJECT_DIR is not set for this server. ' +
+            'Pass a project name or path explicitly.',
+        );
+      }
+      project = dir;
+    }
+
+    let sessionScope: SessionScope | undefined;
+    const sessionArg = args.session_id as string | undefined;
+    if (sessionArg) {
+      const resolved = await resolveSession(sessionArg);
+      if (resolved.error) throw new Error(resolved.error);
+      sessionScope = {
+        sessionId: resolved.sessionId!,
+        projectDir: resolved.projectDir!,
+        filename: resolved.filename!,
+      };
+    }
 
     // Validate: most scopes require a query
     const queryRequired = !['sessions', 'tools', 'files'].includes(scope);
@@ -282,6 +341,7 @@ class ClaudeHistorianServer {
           project,
           timeframe,
           limit,
+          sessionScope,
         );
         const text = this.formatter.formatSearchConversations(result.results, detailLevel, limit);
         return { content: [{ type: 'text', text }] };
@@ -380,23 +440,23 @@ class ClaudeHistorianServer {
 
       case 'all':
       default: {
-        // Parallel fan-out: conversations + plans + config + memories + errors + sessions + tools
-        const [
-          convResult,
-          planResult,
-          configResult,
-          memoryResult,
-          errorResult,
-          sessionResult,
-          toolResult,
-        ] = await Promise.allSettled([
-          this.universalEngine.searchConversations(query!, project, timeframe, limit),
+        // Fan-out over conversations plus the three cheap markdown scopes.
+        //
+        // errors, sessions and tools used to run here too. Each is an
+        // independent full-corpus pass, and their pre-filter terms are so
+        // common they barely filter — ['error','failed','exception','cannot']
+        // and ['tool_use'] match almost every line — so they cost MORE than
+        // the conversations search they were bundled with. Four concurrent
+        // passes contending on a 4-thread pool made the default scope the
+        // slowest thing the server did, by an order of magnitude.
+        //
+        // They remain available by asking for them explicitly, which is what
+        // the scope description and the server instructions now tell callers.
+        const [convResult, planResult, configResult, memoryResult] = await Promise.allSettled([
+          this.universalEngine.searchConversations(query!, project, timeframe, limit, sessionScope),
           this.universalEngine.searchPlans(query!, limit),
           this.searchEngine.searchConfig(query!, limit),
           this.searchEngine.searchMemories(query!, limit),
-          this.universalEngine.getErrorSolutions(query!, limit),
-          this.universalEngine.getRecentSessions(limit, project),
-          this.universalEngine.getToolPatterns(query || undefined, limit),
         ]);
 
         // Merge and deduplicate results
@@ -424,43 +484,6 @@ class ClaudeHistorianServer {
         if (memoryResult.status === 'fulfilled') {
           allMessages.push(...memoryResult.value.messages);
         }
-        if (errorResult.status === 'fulfilled') {
-          for (const sol of errorResult.value.results) {
-            for (const msg of sol.solution) {
-              allMessages.push({
-                ...msg,
-                uuid: msg.uuid || `error-${sol.errorPattern}`,
-                content: `[Error: ${sol.errorPattern}] ${msg.content}`,
-                relevanceScore: (msg.relevanceScore || 0) + sol.frequency,
-              });
-            }
-          }
-        }
-        if (sessionResult.status === 'fulfilled') {
-          for (const sess of sessionResult.value.results) {
-            allMessages.push({
-              uuid: `session-${sess.session_id}`,
-              timestamp: sess.end_time ?? sess.start_time ?? '',
-              type: 'assistant',
-              content: `[Session: ${sess.project_path?.split('/').pop() || 'unknown'}] ${(sess.accomplishments || []).join(', ')}`,
-              sessionId: sess.session_id,
-              projectPath: sess.project_path ?? undefined,
-              relevanceScore: 0,
-            });
-          }
-        }
-        if (toolResult.status === 'fulfilled') {
-          for (const pat of toolResult.value.results) {
-            if (pat.successfulUsages[0]) {
-              allMessages.push({
-                ...pat.successfulUsages[0],
-                uuid: pat.successfulUsages[0].uuid || `tool-${pat.toolName}`,
-                content: `[Tool: ${pat.toolName}] ${pat.successfulUsages[0].content}`,
-              });
-            }
-          }
-        }
-
         // Deduplicate by uuid (same message can appear from multiple scopes)
         const seen = new Set<string>();
         const deduped = allMessages.filter((m) => {
@@ -469,9 +492,11 @@ class ClaudeHistorianServer {
           seen.add(key);
           return true;
         });
-        const sorted = deduped
-          .sort((a, b) => (b.relevanceScore || 0) - (a.relevanceScore || 0))
-          .slice(0, limit);
+        // Sort on the same value the formatter displays. Sorting on
+        // relevanceScore while rendering finalScore emitted rows in an order
+        // that contradicted their own printed scores (100, 89, 33, 81, 70).
+        const rank = (m: CompactMessage): number => m.finalScore ?? m.relevanceScore ?? 0;
+        const sorted = deduped.sort((a, b) => rank(b) - rank(a)).slice(0, limit);
 
         const mergedResult = {
           messages: sorted,
@@ -489,12 +514,19 @@ class ClaudeHistorianServer {
   private async handleInspect(
     args: Record<string, unknown>,
   ): Promise<{ content: { type: 'text'; text: string }[] }> {
-    const sessionId = args.session_id as string;
+    let sessionId = args.session_id as string;
     const maxMessages = (args.max_messages as number) || 10;
     const focus = (args.focus as string) || 'all';
 
     if (!sessionId) {
       throw new Error('session_id is required');
+    }
+
+    // "current" is exact; "latest" would be a modification-time guess.
+    if (sessionId.toLowerCase() === 'current') {
+      const resolved = await resolveSession('current');
+      if (resolved.error) throw new Error(resolved.error);
+      sessionId = resolved.sessionId!;
     }
 
     const result = await this.universalEngine.generateCompactSummary(sessionId, maxMessages, focus);
@@ -523,10 +555,18 @@ class ClaudeHistorianServer {
   private async handleTranscript(
     args: Record<string, unknown>,
   ): Promise<{ content: { type: 'text'; text: string }[] }> {
-    const sessionId = (args.session_id as string) || 'latest';
+    let sessionId = (args.session_id as string) || 'latest';
     const format = (args.format as string) || 'text';
     const maxMessages = args.max_messages as number | undefined;
     const latest = args.latest as number | undefined;
+
+    // "current" is exact; "latest" resolves by modification time and can land
+    // on a different live conversation when several sessions are open.
+    if (sessionId.toLowerCase() === 'current') {
+      const resolved = await resolveSession('current');
+      if (resolved.error) throw new Error(resolved.error);
+      sessionId = resolved.sessionId!;
+    }
 
     const result = await this.universalEngine.getSessionTranscript(sessionId);
 

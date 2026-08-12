@@ -81,10 +81,19 @@ function estimateTokens(text: string): number {
  * @param content - Full message content.
  * @returns Abbreviated content suitable for summary-level display.
  */
-function summarizeContent(content: string): string {
+function summarizeContent(content: string, limit = SUMMARY_CONTENT_LIMIT): string {
   const stripped = content.replace(/```[\s\S]*?```/g, '[code]').replace(/\n{2,}/g, '\n');
-  return stripped.length > 200 ? stripped.substring(0, 200) + '...' : stripped;
+  return stripped.length > limit ? stripped.substring(0, limit) + '...' : stripped;
 }
+
+/**
+ * Characters of content shown per result in summary mode.
+ *
+ * @remarks
+ * 200 was too short to tell whether a hit answered the question, which made
+ * every search a two-step: find something, then fetch it again to read it.
+ */
+const SUMMARY_CONTENT_LIMIT = 500;
 
 // ── Formatter class ────────────────────────────────────────────────
 
@@ -327,6 +336,19 @@ export class BeautifulFormatter {
         content: isSummary ? summarizeContent(msg.content) : msg.content,
         project: msg.projectPath?.split('/').pop() || null,
         score: msg.finalScore || msg.relevanceScore || null,
+        // Provenance makes a hit actionable: without a session id there is no
+        // way to ask for more, and the caller is left re-searching by hand.
+        session: msg.sessionId || null,
+        source: msg.sourceLine ? `${msg.sourceFile}:${msg.sourceLine}` : (msg.sourceFile ?? null),
+        agent: msg.agentId ?? undefined,
+        // Delegated work is collapsed to one row per session; name the agents
+        // behind it so the roll-up is legible rather than lossy.
+        via: msg.contributingAgents?.length
+          ? {
+              hits: msg.rolledUpHits,
+              agents: msg.contributingAgents.map((a) => `${a.agentId} x${a.hits}`),
+            }
+          : undefined,
         ctx: isSummary ? undefined : msg.context || null,
       })),
     };
