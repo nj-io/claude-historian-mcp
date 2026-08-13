@@ -49,6 +49,7 @@ mistake.
 | Successful tool workflows | `search(scope: "tools")` |
 | General search | `search(query: "...", scope: "conversations")` |
 | Deep-dive into a session | `inspect(session_id: "...")` — takes an id from any result, or `"current"` |
+| What were we just talking about? | `transcript(session_id: "current", latest: 10)` — the last N messages |
 | Full text of a session | `transcript(session_id: "current")` — human/assistant text only |
 | Rules, skills, CLAUDE.md | `search(query: "...", scope: "config")` |
 | Task management history | `search(query: "...", scope: "tasks")` |
