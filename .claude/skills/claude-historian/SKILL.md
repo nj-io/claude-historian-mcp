@@ -49,6 +49,7 @@ mistake.
 | Successful tool workflows | `search(scope: "tools")` |
 | General search | `search(query: "...", scope: "conversations")` |
 | Deep-dive into a session | `inspect(session_id: "...")` — takes an id from any result, or `"current"` |
+| Just the files/tools/fixes from a session | `inspect(session_id: "...", focus: "files")` — also `tools`, `solutions` |
 | What were we just talking about? | `transcript(session_id: "current", latest: 10)` — the last N messages |
 | Full text of a session | `transcript(session_id: "current")` — human/assistant text only |
 | Rules, skills, CLAUDE.md | `search(query: "...", scope: "config")` |
@@ -62,6 +63,8 @@ mistake.
 - **`scope`**: `all` (default) covers conversations plus plans, config and memories. `errors`, `sessions`, `tools`, `files`, `similar` and `tasks` are **not** in `all` — name them explicitly.
 - **`timeframe`**: `today`, `yesterday`, `week`, `last-week`, `month`, `last-month`. Other values are ignored silently, so `"7d"` filters nothing. Narrowing here also makes the search faster.
 - **`limit`**: Number of results (default 10).
+- **`focus`** (inspect): `all` (default), or narrow a session summary to `files`, `tools` or `solutions`.
+- **`latest`** / **`max_messages`** (transcript): read the last N messages, or the first N. `latest` wins if both are given.
 - **`detail_level`**: `summary` (default), `detailed` for full content and context, `raw` for the underlying records.
 
 ## Reading results
