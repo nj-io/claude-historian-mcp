@@ -29,7 +29,8 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck && npm run lint",
     "prepublishOnly": "npm run build && npm run lint && npm run format:check",
-    "prepare": "husky || true"
+    "prepare": "husky || true",
+    "check:skill": "npm run build && node scripts/check-skill.mjs"
   },
   "keywords": [
     "claude",
